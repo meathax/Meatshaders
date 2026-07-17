@@ -15,18 +15,23 @@ video.cpp at the pinned commits; see rtl-verify agent report):
         in the line buffers) — there is no headroom between H and V.
     F2. Adaptive blend (V stage): control lum = max(R,G,B) of the H-FILTERED,
         clamped, NEAREST-line pixel at the current column (nearest switches
-        at vfrac = 0.5). Blend is linear with one 1-bit truncation:
-        c128 = ((A128*(256-lum) + B128*lum) >> 9) << 1. Set A applies at
-        lum=0; set B is never fully reached (max weight 255/256).
+        at vfrac = 0.5).  The stored 2.8 coefficients are multiplied by the
+        2.8 blend weights, summed in 4.16, then sliced with t(18 downto 1):
+        c128 = (A*(256-lum) + B*lum) >> 1.  This is one arithmetic truncation
+        and can produce odd 3.15 values.  Set A applies at lum=0; set B is
+        never fully reached (max weight 255/256).
         H-stage control is the nearest SOURCE pixel (post-gamma, unfiltered).
-        Only ONE adaptive slot exists: H's adaptive set beats V's.
+        Only ONE adaptive-secondary slot exists.  Main uploads H's secondary
+        set when both axes request adaptation, but the RTL blend arbitration
+        gives V priority; selecting adaptive filters on both axes therefore
+        mismatches the sets and is unsupported.
     F3. Shadow mask: per-channel multiplier m/16 computed as a sum of
         INDEPENDENTLY truncated shifts over the set bits of m
         (x*m/16 = sum over set bits k of floor(x >> (4-k))), 9-bit result,
         >=256 saturates to 255. Multipliers with many set bits (e.g. 15/16)
         truncate hardest (up to ~3.75 codes low on dark values).
     F4. Phase selection: 256 phases = top 8 bits of the 12-bit fraction;
-        taps at [-1, 0, +1, +2] around the base line; bottom edge replicates.
+        taps at [-1, 0, +1, +2] around the base line; both edges replicate.
     F5. Invalid filter files silently fall back to nearest-neighbour tables;
         v6 (non-adaptive) cores receive only the FIRST set of adaptive files.
 """
@@ -60,10 +65,20 @@ def _fir_accumulate(taps: np.ndarray, c128: np.ndarray) -> np.ndarray:
 
 
 def _positions_to_taps(positions: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve source positions exactly like ascal's 12-bit fraction path.
+
+    ``o_[hv]frac`` is a 12-bit unsigned fraction and a 256-phase core indexes
+    the coefficient RAM with bits 11..4.  Selecting the phase is therefore a
+    truncation (floor), not a nearest-phase rounding.  Keeping the explicit
+    12-bit step here also makes boundary behaviour testable and prevents a
+    value just below the next source pixel from carrying into that pixel.
+    """
     base = np.floor(positions).astype(np.int64)
-    ph = np.round((positions - base) * 256).astype(np.int64)
-    base = base + (ph == 256).astype(np.int64)                # carry into next window
-    phase = ph & 0xFF
+    frac12 = np.floor((positions - base) * 4096.0).astype(np.int64)
+    # Floating-point callers can only approach the [0, 4095] hardware range;
+    # clamp defensively rather than inventing a carry that the RTL cannot emit.
+    frac12 = np.clip(frac12, 0, 4095)
+    phase = frac12 >> 4                                      # bits 11..4
     taps_idx = np.clip(base[:, None] + np.arange(-1, 3)[None, :], 0, n - 1)
     return taps_idx, phase
 
@@ -83,10 +98,14 @@ def fir_1d(line_values: np.ndarray, coeffs: np.ndarray, positions: np.ndarray) -
 def adaptive_c128(dark: np.ndarray, bright: np.ndarray, phase: np.ndarray,
                   ctrl: np.ndarray) -> np.ndarray:
     """Blended coefficients in x128 units per F2. ctrl in 0..255 (lum)."""
-    a128 = dark[phase].astype(np.int64) * 128                 # (M, 4)
-    b128 = bright[phase].astype(np.int64) * 128
+    a = dark[phase].astype(np.int64)                          # 2.8 (M, 4)
+    b = bright[phase].astype(np.int64)
     lum = ctrl[:, None].astype(np.int64)
-    return (((a128 * (256 - lum) + b128 * lum) >> 9) << 1)    # 1-bit truncation
+    # ascal poly_lerp: (2.8 * 2.8 + 2.8 * 2.8) is 4.16, then
+    # t(18 downto 1) converts it to 3.15.  This is one arithmetic >> 1;
+    # the result may legitimately be odd.  The old >>9/<<1 formulation
+    # discarded an additional bit and incorrectly forced every result even.
+    return (a * (256 - lum) + b * lum) >> 1
 
 
 def fir_1d_adaptive(line_values: np.ndarray, dark: np.ndarray, bright: np.ndarray,

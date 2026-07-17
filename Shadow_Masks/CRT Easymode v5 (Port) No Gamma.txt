@@ -1,0 +1,10 @@
+####
+# Name: CRT Easymode v5 (Port) No Gamma
+# crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Fitted in encoded space with MiSTer's exact saturating mask arithmetic
+# Dedicated pixel-local mask for gamma=off / identity LUT
+# Selected by whole-pipeline self-gate: identity-mask recalibration
+####
+v2
+3,1
+43f,23f,13f

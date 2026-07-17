@@ -1,12 +1,64 @@
 ====================================================================
- MAXIMUM-FIDELITY AUDIT - MiSTer CRT Easymode / CRT Lottes Ports
+ EXACT-HARDWARE AUDIT - COMPLETE MiSTer CRT PORT PACK
 ====================================================================
 
-Audit completed: 2026-07-16
-Edition: v4 maximum-fidelity
+Audit completed: 2026-07-17
+Edition: v6 pixel-accuracy / hardware-limit audit
 Reference MiSTer Main: 7317947f41f6d085444ff00d297896aba2041ca0
 Reference MiSTer Template: 6d29ac7ca3c721792a72e30393357c57fb7f8f1b
-Reference libretro shaders: 2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
+References: glsl-shaders 2b2c5ee3; slang-shaders 3b0d6aa1
+
+
+CURRENT ACCEPTANCE RESULTS
+--------------------------
+Exact endpoint-inclusive end-to-end RMS through the mask over the complete periodic LCM
+supercell (output codes):
+
+                            Default   Fixed   No Gamma
+  CRT Guest Advanced          1.230   4.785      2.029
+  CRT Royale                 16.720  23.497     17.370
+  CRT Royale Kurozumi        19.854  25.311     19.517
+  CRT Easymode v5             3.591   9.286      6.207
+  CRT Lottes                  1.260   1.166   off by design
+
+Maximum errors in the same family order are:
+  Default     7.4 /  77.0 / 112.3 / 18.1 / 4.5
+  Fixed      25.9 / 102.4 / 149.3 / 30.0 / 4.5
+  No Gamma   10.4 /  77.0 /  79.7 / 21.7 / off by design
+They are hard-gated alongside RMS. Kurozumi code 0 has its own channel-aware
+gate: 1.005 RMS, 3.7 maximum, preserving LUT[0] = (5,2,2) and the warm colored
+black lift.
+
+Optional Edge Stable results (RMS / selector-only jump / moire):
+  Guest Advanced        1.763 /  0 / 1.78
+  Royale               28.029 / 16 / 5.31
+  Easymode v5           8.818 / 12 / 2.96
+
+Kurozumi Default is pixel-local. Perceptual Dither measures 2.99 codes only
+after integrating partner pixels; its honest raw-pixel pipeline result is
+30.901 RMS with a 118.3-code maximum. Default moire results are 1.71 / 5.31 /
+6.82 / 2.24 / 1.38 for Guest, Royale, Kurozumi, Easymode v5 and Lottes: every
+Default passes the 7.65 guard. Anti-Moire remains an optional Kurozumi profile
+with a wider 2.07-code stability margin.
+
+The current hardware model fixes two subtle RTL errors in earlier audits:
+runtime scaler phase is the upper eight fractional bits (`frac12 >> 4`) with
+no rounding/carry, and adaptive coefficients use one signed `>> 1` after the
+weighted sum, so odd 3.15 values are valid. Mask scores use
+lcm(hardware period, reference period), not one upper-left hardware crop.
+
+Current inventory: 44 filters, 10 gamma LUTs, 21 masks and 40 presets. Five
+reference modules are vendored in tools/targets/. All arithmetic, quantizer,
+format, preset, anti-ring, full-period/2x-mask and end-to-end gates pass.
+
+
+====================================================================
+ HISTORICAL V4 AUDIT (SUPERSEDED METRICS; RETAINED AS RELEASE HISTORY)
+====================================================================
+
+The sections below preserve the reasoning and measurements from prior releases.
+Where they conflict with CURRENT ACCEPTANCE RESULTS, the current full-period
+and channel-aware numbers above are authoritative.
 
 
 BOTTOM LINE
@@ -75,15 +127,24 @@ V4 IMPROVEMENTS
    most one coefficient unit when exact symmetry and an odd target sum conflict.
 
 
-6. Optional Easymode pixel-art anti-ringing approximation added
+6. Easymode pixel-art anti-ringing approximation retired after exact audit
 
-   The source clamp is nonlinear and cannot be a fixed FIR. The optional H
-   table is a DC-constrained least-squares fit over all 16 binary four-pixel
-   neighbourhoods. It substantially reduces hard-edge ringing while the
-   canonical H remains the continuous-tone/source-kernel default.
+   The old optional table fitted the source's nonlinear local min/max clamp
+   over 16 binary neighbourhoods, but its objective omitted MiSTer's mandatory
+   H-stage 0..255 saturation. On binary data that hardware clamp already has
+   the same bounds as the source clamp: equal inner taps imply 0 or 255, while
+   different inner taps span the complete code range.
 
-   Quantised binary-neighbourhood RMSE: 0.040554 -> 0.021246
-   (47.6% reduction).
+   Exact pairwise-truncation results over phases 0..128:
+
+     canonical H        binary RMSE 0.5343, five-level RMSE 2.8624
+     former anti-ring   binary RMSE 4.5878, five-level RMSE 5.0993
+
+   Nonnegative two/four-tap fits and clipped-negative kernels were worse.
+   Model-loop aggregate compromises exist, but every nontrivial candidate
+   regressed at least one binary or five-level neighbourhood in the pointwise
+   search. The Pixel-Art preset names are therefore retained as compatibility
+   aliases of canonical normal/matched-boost H tables.
 
 
 7. Lottes' enabled-by-default bloom is now represented
@@ -177,7 +238,8 @@ The completed package is checked for:
   - explicit interlace fallbacks for landscape and TATE;
   - ZIP integrity and byte-identical extraction.
 
-Final inventory: 20 filter files, 2 gamma LUTs, 8 shadow masks and 19 presets.
+Historical v4 inventory: 20 filter files, 2 gamma LUTs, 8 shadow masks and
+19 presets. See the current inventory at the top of this report.
 
 This is mathematical/RTL validation. Final preference still depends on panel
 EOTF, viewing distance and phosphor-pitch taste; no physical MiSTer/display A/B
@@ -188,8 +250,11 @@ source hashes, licensing and implementation references.
 
 
 ====================================================================
- V5 AUDIT (2026-07-17) - GUEST ADVANCED / ROYALE / KUROZUMI PORTS
+ HISTORICAL V5.0 AUDIT (SUPERSEDED) - GUEST / ROYALE / KUROZUMI
 ====================================================================
+
+The row-sum constraint, mask-off objective and quoted results in this section
+are historical. They are not current acceptance results.
 
 METHOD
 ------
@@ -252,8 +317,12 @@ machine. The 1080p moire guard passes for all shipped adaptive tables at
 
 
 ====================================================================
- V5.1 AUDIT (2026-07-17) - SECOND PASS OVER THE WHOLE PACK
+ HISTORICAL V5.1 AUDIT (SUPERSEDED) - SECOND PASS
 ====================================================================
+
+This release introduced honest mask-on scoring but still evaluated only one
+hardware-sized crop and made pair-averaged Kurozumi dither the default. Both
+choices are superseded by the current full-period pixel-local audit.
 
 THE METRIC WAS WRONG, AND IT MATTERED
 -------------------------------------
@@ -351,14 +420,19 @@ Both Default presets degrade badly on cores without adaptive filter support
 Fixed Compatibility presets there - this is why they exist.
 
 Two horizontal error sources remain invisible to every flat-field metric in
-this pack: the anti-ringing clamp (Easymode, ~6 codes RMS on midtone content)
-and linear-vs-encoded filtering order (up to ~81 codes on a hard black/white
-edge). Both are horizontal-only and unfixable within a single pre-scaler LUT.
+this pack: Easymode's nonlinear local anti-ringing clamp and linear-vs-encoded
+filtering order (up to ~81 codes on a hard black/white edge). Both are
+horizontal-only and cannot be reproduced pointwise-safely by one fixed FIR and
+one pre-scaler LUT.
 
 
 ====================================================================
- V5.2 AUDIT (2026-07-17) - THE ROW-SUM RULE WAS WRONG
+ HISTORICAL V5.2 AUDIT (CROPPED MASK METRIC) - ROW-SUM RULE
 ====================================================================
+
+The behavioral clipping insight remains valid. The mask numbers do not: this
+release scored only the upper-left hardware-sized crop rather than the full
+LCM supercell.
 
 The v5 design rule "keep every V row sum <= 256" was inherited from the v4
 Easymode post-mortem, where over-unity rows really were clipping highlights.
@@ -422,6 +496,9 @@ HONEST NOTES
 
 JOINT MASK REFIT
 ----------------
+Historical warning: the 14.616 / -11.7% Royale result below is invalid under
+full-period scoring. The current regenerated Royale Default is 16.720 codes.
+
 Fitting the mask to the shader's multipliers in isolation is the wrong
 objective: it leaves the mask unable to compensate for anything upstream. Two
 things it therefore cannot fix - the clamp-order mismatch (the shader clips

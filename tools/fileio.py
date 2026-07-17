@@ -44,6 +44,7 @@ class FilterFile:
 def parse_filter(path: str) -> FilterFile:
     header, rows = [], []
     adaptive = tenbit = False
+    saw_rows = False
     with open(path, encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -54,15 +55,24 @@ def parse_filter(path: str) -> FilterFile:
                 continue
             low = line.lower()
             if low == "adaptive":
+                if saw_rows:
+                    raise ValueError(f"{path}: adaptive marker after coefficient rows")
+                if adaptive:
+                    raise ValueError(f"{path}: duplicate adaptive marker")
                 adaptive = True
                 continue
             if low == "10bit":
+                if saw_rows:
+                    raise ValueError(f"{path}: 10bit marker after coefficient rows")
+                if tenbit:
+                    raise ValueError(f"{path}: duplicate 10bit marker")
                 tenbit = True
                 continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 4:
                 raise ValueError(f"{path}: bad row {line!r}")
             rows.append([int(p) for p in parts])
+            saw_rows = True
     n = len(rows)
     if n == PHASES:
         sets = [np.array(rows, dtype=np.int32)]
@@ -240,6 +250,11 @@ def write_mask(path: str, mask: MaskFile) -> None:
 
 def validate_mask(mask: MaskFile, path: str = "<mask>") -> list[str]:
     problems = []
+    if not 1 <= mask.width <= 16 or not 1 <= mask.height <= 16:
+        problems.append(f"{path}: dimensions {mask.width}x{mask.height} "
+                        "outside hardware range 1..16")
+    if len(mask.tokens) != mask.height or any(len(row) != mask.width for row in mask.tokens):
+        problems.append(f"{path}: token grid does not match {mask.width}x{mask.height}")
     for row in mask.tokens:
         for tok in row:
             if not re.fullmatch(r"[0-9a-fA-F]{1,3}", tok):
@@ -256,6 +271,15 @@ def validate_mask(mask: MaskFile, path: str = "<mask>") -> list[str]:
 PRESET_KEYS = ("hfilter", "vfilter", "sfilter", "ifilter", "gamma", "mask", "maskmode")
 _PRESET_DIRS = {"hfilter": "Filters", "vfilter": "Filters", "sfilter": "Filters",
                 "ifilter": "Filters", "gamma": "Gamma", "mask": "Shadow_Masks"}
+_PRESET_DISABLED = {
+    "hfilter": {"same", "off"},
+    "vfilter": {"same", "off"},
+    "sfilter": {"same", "off"},
+    "ifilter": {"same", "off"},
+    "gamma": {"off", "none"},
+    "mask": {"off", "none"},
+}
+MASK_MODES = ("off", "none", "1x", "2x", "1x rotated", "2x rotated")
 
 
 def parse_preset(path: str) -> dict[str, str]:
@@ -265,8 +289,13 @@ def parse_preset(path: str) -> dict[str, str]:
             line = raw.strip()
             if not line or line.startswith(("#", ";", "[")):
                 continue
-            key, _, value = line.partition("=")
-            entries[key.strip()] = value.strip()
+            key, sep, value = line.partition("=")
+            if not sep:
+                raise ValueError(f"{path}: malformed preset line {line!r}")
+            key = key.strip().lower()
+            if key in entries:
+                raise ValueError(f"{path}: duplicate preset key {key!r}")
+            entries[key] = value.strip()
     return entries
 
 
@@ -280,14 +309,34 @@ def write_preset(path: str, entries: dict[str, str]) -> None:
 
 
 def validate_preset(entries: dict[str, str], root: str, path: str = "<preset>") -> list[str]:
-    """Check keys and that referenced files exist case-sensitively under root."""
+    """Validate a complete Main-compatible preset and resolve files exactly."""
     problems = [f"{path}: unknown key {k!r}" for k in entries if k not in PRESET_KEYS]
+    problems += [f"{path}: missing required key {k!r}" for k in PRESET_KEYS if k not in entries]
     for key, sub in _PRESET_DIRS.items():
         value = entries.get(key)
-        if value is None or value.lower() in ("same", "off", "none"):
+        if value is None:
+            continue
+        if not value:
+            problems.append(f"{path}: {key} is empty")
+            continue
+        low = value.lower()
+        if low in _PRESET_DISABLED[key]:
+            continue
+        # These words are only special for some fields. For example, Main
+        # treats gamma=same and ifilter=none as literal filenames, not no-ops.
+        if low in {"same", "off", "none"}:
+            allowed = ", ".join(sorted(_PRESET_DISABLED[key]))
+            problems.append(f"{path}: {key}={value!r} is not a valid sentinel "
+                            f"(allowed: {allowed})")
             continue
         folder = os.path.join(root, sub)
         listing = os.listdir(folder) if os.path.isdir(folder) else []
         if value not in listing:
             problems.append(f"{path}: {key}={value!r} not found (case-sensitive) in {sub}/")
+    mode = entries.get("maskmode")
+    if mode is not None:
+        if not mode:
+            problems.append(f"{path}: maskmode is empty")
+        elif mode.lower() not in MASK_MODES:
+            problems.append(f"{path}: unsupported maskmode {mode!r}")
     return problems

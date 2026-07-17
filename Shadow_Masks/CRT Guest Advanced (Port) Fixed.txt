@@ -1,0 +1,10 @@
+####
+# Name: CRT Guest Advanced (Port) Fixed
+# crt-guest-advanced (guest.r); libretro/slang-shaders @ 3b0d6aa1d134
+# Fitted in encoded space with MiSTer's exact saturating mask arithmetic
+# Dedicated pixel-local mask for the non-adaptive rank-1 pipeline
+# Selected by whole-pipeline self-gate: mask-aware fixed pair
+####
+v2
+2,1
+50e,20e

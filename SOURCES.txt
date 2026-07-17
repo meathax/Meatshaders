@@ -1,8 +1,8 @@
 ============================================================
- SOURCES, PROVENANCE AND FORMAT REFERENCES - v4 maximum-fidelity edition
+ SOURCES, PROVENANCE AND FORMAT REFERENCES - v6 exact-hardware edition
 ============================================================
 
-Audit date: 2026-07-16
+Audit date: 2026-07-17
 
 Canonical shader sources
 ------------------------
@@ -74,7 +74,9 @@ Easymode:
   - canonical Lanczos-family H with SHARPNESS_H squared as in source;
   - direct phase/RGB fit to MiSTer max-RGB adaptive interpolation;
   - source cutoff vertical interpolation with SHARPNESS_V=1;
-  - DC-constrained binary-neighbourhood fit for optional anti-ringing H;
+  - exact binary/multilevel audit of the retired anti-ringing H fit; the stable
+    Pixel-Art preset names now alias canonical H after no pointwise-safe fixed
+    FIR improvement was found in the exact integer search;
   - exact shadowmask.sv shift/add/truncate model for paired gain fitting.
 
 Lottes:
@@ -83,8 +85,11 @@ Lottes:
   - exact piecewise sRGB target evaluation for matched V/mask fitting;
   - exact shadowmask.sv arithmetic for 47e/27e/17e calibration.
 
-All stored tables are sampled at phase i/256 and quantised to 1/256. Conjugate
-phase rows are emitted as exact tap reversals; phase 128 is self-symmetric.
+All stored tables contain 256 phases and are quantised to signed 10-bit values.
+Current RTL selects runtime phase by truncating the 12-bit fraction to its top
+eight bits (`frac12 >> 4`), with no rounding or carry. Adaptive A/B interpolation
+performs one signed shift after the weighted sum, so odd 3.15 coefficients are
+valid. Conjugate rows are exact tap reversals; phase 128 is self-symmetric.
 
 
 Port status
@@ -98,7 +103,7 @@ original shader programs. See README.txt and AUDIT_REPORT.txt for limitations.
 
 
 ============================================================
- V5 ADDITIONS (2026-07-17)
+ EXPANDED SHADER SOURCES AND CURRENT TOOLCHAIN (2026-07-17)
 ============================================================
 
 Canonical shader sources (libretro/slang-shaders, all pinned to commit
@@ -111,13 +116,27 @@ CRT Royale (by TroggleMonkey, GPL):
 CRT Royale Kurozumi (P22/PVM parameter preset over crt-royale):
   presets/crt-royale-kurozumi.slangp (+ grade.slang pass)
 
-MiSTer implementation references re-verified for v5 at the same pinned
+Reproducible executable references are vendored in tools/targets/:
+  easymode_ref.py
+  guest_advanced_ref.py
+  kurozumi_ref.py
+  lottes_ref.py
+  royale_ref.py
+
+They replace the original session scratchpad dependency. The build uses these
+files by default; MISTER_SHADER_REFERENCES is only an explicit override.
+
+MiSTer implementation references re-verified for v6 at the same pinned
 commits as v4 (Main 7317947f, Template 6d29ac7c): ascal.vhd polyphase and
 adaptive-lerp arithmetic, shadowmask.sv v2 token decode and shift/add
 truncation, video.cpp preset/filter/gamma/mask parsing, video_mixer.sv
 gamma placement, sys_top.v pipeline order.
 
-V5 toolchain (kept in tools/ so the pack can be regenerated):
+Rechecked 2026-07-17: Main's current HEAD still equals the pinned Main commit.
+Template has advanced, but comparison from 6d29ac7c to current HEAD changes
+only sys/yc_out.sv; the audited scaler and shadow-mask RTL is unchanged.
+
+Current toolchain (kept in tools/ so the pack can be regenerated):
   fileio.py         format parsers/writers/validators
   quantize.py       symmetric 10-bit quantizer
   mister_model.py   RTL-exact pipeline model (F1-F5 verified facts)
@@ -125,7 +144,18 @@ V5 toolchain (kept in tools/ so the pack can be regenerated):
   build_port.py     per-shader generation driver
   validate_port.py  acceptance gates (formats, RMSE, brightness,
                     clipping, moire)
+  validate_patterns.py nonuniform selector/RGB/impulse/step/checker diagnostics
+  preset_contracts.py complete 40-preset semantic and axis contracts
+  selftest_mister_model.py exact phase/FIR/adaptive/mask arithmetic regressions
+  selftest_mask_period.py full-LCM FFT vs brute force, including mask mode 2x
+  selftest_presets.py exact preset inventory and cross-preset pairings
+  selftest_easymode_antiring.py source-clamp and compatibility-alias proof
   DESIGN.md         the mapping specification
+
+Current acceptance evaluates the complete periodic LCM supercell, reports both
+best rigid roll and strict origin, refines Kurozumi channel-aware through its
+colored black lift, and gates gamma unique-level/plateau/step diagnostics plus
+both RMS and maximum individual-pixel error.
 
 Guest Advanced and Royale sources are GPL; the derived coefficient tables
 retain that licensing status. Kurozumi is a parameter set over Royale.

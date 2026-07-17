@@ -1,8 +1,9 @@
 ####
 # Name: CRT Easymode v5 (Port)
 # crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
-# Shader mask as rendered at 1080p, fitted in encoded space with MiSTer's exact mask arithmetic
-# Carries the 1.105 gain-split factor - use ONLY with the matching (Port) gamma
+# Fitted in encoded space with MiSTer's exact saturating mask arithmetic
+# Carries the 1.105 gain-split factor; pair only with the matching (Port) gamma
+# Pixel-local objective over the complete hardware/reference LCM supercell
 # Tile kind: mean
 ####
 v2

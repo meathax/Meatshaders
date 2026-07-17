@@ -1,7 +1,8 @@
-"""Self-test: parse, validate and round-trip every existing v4 file in the pack.
+"""Self-test: parse, validate and round-trip every data file in the pack.
 
-The v4 files passed the original audit, so every one of them must parse clean,
-validate clean, and survive write -> re-parse with identical data.
+Every shipped file must parse cleanly, validate cleanly, and survive
+write -> re-parse with identical data. Negative fixtures cover format hazards
+that MiSTer otherwise accepts silently or interprets differently by field.
 """
 
 import glob
@@ -17,6 +18,7 @@ import fileio  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
 counts = {"filter": 0, "gamma": 0, "mask": 0, "preset": 0}
+EXPECTED_COUNTS = {"filter": 44, "gamma": 10, "mask": 21, "preset": 40}
 
 with tempfile.TemporaryDirectory() as tmp:
     for path in sorted(glob.glob(os.path.join(ROOT, "Filters", "*.txt"))):
@@ -75,6 +77,53 @@ with tempfile.TemporaryDirectory() as tmp:
             counts["preset"] += 1
         except Exception as e:
             failures.append(f"{name}: EXCEPTION {e}")
+
+    # Regression checks for malformed files and Main's field-specific preset
+    # sentinels. These deliberately exercise failures, not shipped data.
+    sample_path = sorted(glob.glob(os.path.join(ROOT, "Presets", "*.ini")))[0]
+    sample = fileio.parse_preset(sample_path)
+
+    missing = dict(sample)
+    del missing["mask"]
+    if not any("missing required key 'mask'" in p
+               for p in fileio.validate_preset(missing, ROOT, "missing.ini")):
+        failures.append("negative preset test: missing key was accepted")
+
+    bad_mode = dict(sample, maskmode="3x")
+    if not any("unsupported maskmode" in p
+               for p in fileio.validate_preset(bad_mode, ROOT, "mode.ini")):
+        failures.append("negative preset test: invalid maskmode was accepted")
+
+    for key, value in (("gamma", "same"), ("mask", "same"), ("ifilter", "none")):
+        bad_sentinel = dict(sample, **{key: value})
+        if not any("not a valid sentinel" in p
+                   for p in fileio.validate_preset(bad_sentinel, ROOT, "sentinel.ini")):
+            failures.append(f"negative preset test: {key}={value} was accepted")
+
+    oversized = fileio.MaskFile([], 17, 1, [["000"] * 17])
+    if not any("outside hardware range" in p for p in fileio.validate_mask(oversized)):
+        failures.append("negative mask test: 17-column mask was accepted")
+
+    duplicate_path = os.path.join(tmp, "duplicate.ini")
+    with open(duplicate_path, "w", encoding="utf-8") as f:
+        f.write("gamma=off\ngamma=none\n")
+    try:
+        fileio.parse_preset(duplicate_path)
+        failures.append("negative preset test: duplicate key was accepted")
+    except ValueError:
+        pass
+
+    late_marker_path = os.path.join(tmp, "late-marker.txt")
+    with open(late_marker_path, "w", encoding="utf-8") as f:
+        f.write("0,256,0,0\n10bit\n")
+    try:
+        fileio.parse_filter(late_marker_path)
+        failures.append("negative filter test: late 10bit marker was accepted")
+    except ValueError:
+        pass
+
+if counts != EXPECTED_COUNTS:
+    failures.append(f"inventory mismatch: expected {EXPECTED_COUNTS}, got {counts}")
 
 print(f"parsed: {counts}")
 if failures:

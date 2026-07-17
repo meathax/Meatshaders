@@ -1,11 +1,12 @@
 ====================================================================
- CRT EASYMODE & CRT LOTTES - MiSTer maximum-fidelity fixed-pipeline ports
- Audited edition v4 (2026-07-16)
+ CRT SHADER PORTS - MiSTer exact-hardware fixed-pipeline edition
+ Pixel-accuracy audit v6 (2026-07-17)
 ====================================================================
 
-These files reproduce as much of the canonical CRT Easymode and CRT Lottes
-GLSL shaders as MiSTer's fixed video pipeline can express. They are scaler
-filters, gamma curves, HDMI shadow masks and presets, not executable shaders.
+These files reproduce as much as MiSTer's fixed video pipeline can express of
+CRT Easymode, Easymode v5, Guest Advanced, Lottes, Royale and Royale Kurozumi.
+They are scaler filters, gamma curves, HDMI shadow masks and presets, not
+executable shaders.
 
 Literal pixel-for-pixel identity is impossible on MiSTer without adding new
 FPGA logic to every core. The original shaders use nonlinear operations after
@@ -13,7 +14,44 @@ filtering, neighbourhood clamps, wider/nonseparable kernels and coordinate
 warping. MiSTer provides a pre-scaler gamma LUT, separable four-tap FIR filters
 and a quantised post-scaler mask. This edition uses hardware-aware fitting,
 late gain placement, full 256-phase/10-bit tables and exact phase symmetry to
-produce the closest practical portable files.
+produce the closest practical portable files. The v6 audit additionally uses
+bit-exact phase truncation and adaptive interpolation, full-period mask scoring,
+channel-aware Kurozumi fitting and hard RMS plus worst-pixel regression gates.
+
+
+CURRENT RESULTS AND CHOICES
+---------------------------
+Exact endpoint-inclusive end-to-end RMS through the mask, in 8-bit output codes:
+
+                            Default   Fixed   No Gamma
+  CRT Guest Advanced          1.230   4.785      2.029
+  CRT Royale                 16.720  23.497     17.370
+  CRT Royale Kurozumi        19.854  25.311     19.517
+  CRT Easymode v5             3.591   9.286      6.207
+  CRT Lottes                  1.260   1.166   off by design
+
+These are full LCM-supercell scores, not the historical upper-left mask crop.
+Every generated Fixed preset now selects its own V/LUT/mask calibration, and
+every No Gamma preset selects a dedicated identity-LUT V/mask pair.
+
+Default is the closest flat-field/source match. Optional Edge Stable presets
+for Guest, Royale and Easymode v5 reduce the half-phase nearest-line control
+jump to 0, 16 and 12 codes respectively while passing the moire guard. Royale
+pays the largest source-flat tradeoff, so use it specifically for hard text or
+sprite edges. Kurozumi already has a zero-code selector jump.
+
+Kurozumi Default is pixel-local. Its optional Perceptual Dither mask integrates
+partner columns toward the PVM phosphor target, but individual pixels carry a
+deliberate high-frequency color residual. Default now passes the fractional-
+scale moire guard at 6.82 codes against the 7.65 ceiling. Anti-Moire measures
+2.07 and remains an optional extra-stability profile.
+
+Literal identity remains impossible where the source uses operations the FPGA
+pipeline does not have. In particular, Royale's 24x24 mask and white bloom,
+Kurozumi's independent phosphor-channel values, per-channel adaptive control,
+and nonlinear local clamps cannot all be represented by four shared taps and
+v2 tokens. This pack now reports those limits rather than hiding them in an
+averaged or cropped metric.
 
 
 QUICK INSTALL
@@ -29,12 +67,25 @@ Then open OSD -> Video Processing -> Load preset.
 
 Best starting presets:
 
+  CRT Easymode v5 - Default
+      Closest current Easymode port; use the legacy family only for comparison.
+
+  CRT Guest Advanced - Default
+      Closest generated port in the expanded family (1.230-code RMS).
+
+  CRT Royale - Default
+      Source-faithful slot-mask profile; Edge Stable is the hard-edge option.
+
+  CRT Royale Kurozumi - Default
+      Pixel-local PVM profile; Anti-Moire adds optional fractional-scale margin.
+
   CRT Easymode - Adaptive
       Closest general Easymode profile on an adaptive-capable core.
 
   CRT Easymode - Pixel-Art Anti-Ring
-      Often cleaner for hard-edged console/arcade pixel art. It approximates
-      Easymode's nonlinear clamp; use Adaptive for the canonical FIR kernel.
+      Compatibility name retained for existing setups. Exact hardware testing
+      found no tested fixed FIR that pointwise improves on the canonical kernel, so
+      this preset now safely aliases Adaptive's canonical H response.
 
   CRT Lottes - Default
       Closest default Lottes profile, including fitted bloom and matched mask.
@@ -78,9 +129,10 @@ Horizontal filters:
     SHARPNESS_H=0.5 is squared internally, giving effective sharpness 0.25.
 
   CRT Easymode Pixel-Art Anti-Ring (Port)_H
-    Fixed-FIR least-squares approximation of the shader's local min/max clamp
-    over binary pixel neighbourhoods. It substantially reduces halos on hard
-    pixel-art edges, but the canonical H filter is more faithful for gradients.
+    Compatibility alias of the canonical H table. The former binary-neighbour
+    least-squares fit omitted MiSTer's mandatory H-stage saturation and was a
+    measurable regression. Easymode's nonlinear local clamp cannot be replaced
+    pointwise-safely by any candidate in the exact integer search.
 
 Vertical filters:
 
@@ -227,9 +279,12 @@ See AUDIT_REPORT.txt and SOURCES.txt for measured results and provenance.
 
 
 ====================================================================
- V5 ADDITIONS (2026-07-17): CRT GUEST ADVANCED, CRT ROYALE,
- CRT ROYALE KUROZUMI
+ HISTORICAL V5.0 NOTES (SUPERSEDED METRICS): GUEST / ROYALE / KUROZUMI
 ====================================================================
+
+This section records the initial v5.0 release. Its row-sum architecture,
+cropped-mask measurements and quoted results are superseded by CURRENT RESULTS
+AND CHOICES above; retain it only as release history.
 
 Three further shader ports, fitted for 1080p output with a toolchain that
 models MiSTer's scaler and mask arithmetic exactly (verified against
@@ -274,8 +329,12 @@ Deep scanlines at fractional scales: 224-line cores at 1080p show a faint
 line-thickness ripple (within the pack's moire guard); vscale_mode=1
 removes it entirely and is recommended for this preset.
 
-V5.2 REVISIONS (2026-07-17)
+HISTORICAL V5.2 REVISIONS (SUPERSEDED MASK METRIC, 2026-07-17)
 ---------------------------
+The 14.616-code Royale claim in this release was computed over only one
+hardware-sized crop. Full-period scoring invalidated that 11.7% claim; the
+current Royale Default is 16.720 over the complete LCM supercell.
+
 The filters are substantially more accurate: Guest Advanced is 2.9x closer to
 the shader, Royale 2.4x, Kurozumi 2.2x. Nothing about the intended look
 changed - this is the same target, hit harder.
@@ -302,8 +361,12 @@ improved Royale by 12% and cut its worst-case error by a third. The same refit
 was tried on every other preset and changed nothing - they were already at
 their best, which is the answer you want from a check like that.
 
-V5.1 REVISIONS (2026-07-17)
+HISTORICAL V5.1 REVISIONS (SUPERSEDED, 2026-07-17)
 ---------------------------
+A later channel-aware/full-period audit supersedes the numbers and Kurozumi
+default-mask choice in this section. The dither described below is now the
+optional Perceptual Dither preset; Default is pixel-local.
+
 A second pass re-examined every shader in the pack against a corrected
 acceptance metric (port pixels vs shader pixels THROUGH the mask - the
 previous mask-off measurement could not see clamp-order error). Results:
@@ -364,8 +427,9 @@ COMPATIBILITY (applies to all three)
 ------------------------------------
 On cores built without adaptive filter support, adaptive files silently run
 on their dark coefficient set only — use the Fixed Compatibility preset
-there. On cores without gamma support the Default preset's LUT silently
-does nothing — use No Gamma (a documented, slightly darker approximation).
+there. Its dedicated fixed V/LUT/mask pair is calibrated as one pipeline.
+On cores without gamma support the Default preset's LUT silently does nothing —
+use No Gamma, which now has a dedicated identity-LUT adaptive V table and mask.
 If Default ever looks drastically darker/harsher than Fixed Compatibility
 on some core, that core is non-adaptive: prefer the Fixed preset.
 (The same applies to the v4 Easymode Adaptive preset, whose two sets differ

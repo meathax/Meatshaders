@@ -23,6 +23,12 @@ import quantize
 
 PHASES = 256
 LUMA_W = np.array([0.2126, 0.7152, 0.0722])
+# Preserve the dense near-black region: Kurozumi deliberately lifts black and
+# colours that lift, so starting every objective at code 8 erases a visible
+# part of the preset.  The remainder keeps the 4-code sampling cost while
+# codes 253..255 explicitly cover the peak-white endpoint that grid omits.
+EVAL_CODES = np.concatenate((np.arange(0, 8), np.arange(8, 256, 4),
+                             np.arange(253, 256)))
 
 
 def _transfer(ref, x: float, channel: str | None = None) -> float:
@@ -34,17 +40,31 @@ def _transfer(ref, x: float, channel: str | None = None) -> float:
     return ref.transfer(x)
 
 
-def _ref_vertical(ref, f: float, x: float) -> float:
+def _ref_vertical(ref, f: float, x: float,
+                  channel: str | None = None) -> float:
     # Profiles are symmetric about f=0.5; some modules only cover 0..0.5.
-    return ref.ref_vertical(min(f, 1.0 - f) if f > 0.5 else f, x)
+    f = min(f, 1.0 - f) if f > 0.5 else f
+    if channel is not None:
+        try:
+            return ref.ref_vertical(f, x, channel)
+        except TypeError:
+            pass
+    return ref.ref_vertical(f, x)
 
 
-def _ref_vertical_unclipped(ref, f: float, x: float) -> float:
+def _ref_vertical_unclipped(ref, f: float, x: float,
+                            channel: str | None = None) -> float:
     """Pre-clip beam value B(f, x); falls back to the clipped value."""
     fn = getattr(ref, "ref_vertical_unclipped", None)
     if fn is None:
-        return _ref_vertical(ref, f, x)
-    return fn(min(f, 1.0 - f) if f > 0.5 else f, x)
+        return _ref_vertical(ref, f, x, channel)
+    f = min(f, 1.0 - f) if f > 0.5 else f
+    if channel is not None:
+        try:
+            return fn(f, x, channel)
+        except TypeError:
+            pass
+    return fn(f, x)
 
 
 def _transfer_unclipped(ref, x: float) -> float:
@@ -88,7 +108,7 @@ def optimize_lut(ref, channels: bool = False, iters: int = 8) -> np.ndarray:
 
     Returns a (256, 3) integer LUT (per-channel scaled for 3-channel refs).
     """
-    xs_i = np.arange(8, 256, 4)
+    xs_i = EVAL_CODES
     xs = xs_i / 255.0
     fs = np.arange(0, 33) / 64.0
     refv = np.array([[_ref_vertical(ref, f, x) for x in xs] for f in fs])   # (33, NX)
@@ -151,7 +171,7 @@ def rmse_exact(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
                lut: np.ndarray, codes: np.ndarray | None = None) -> float:
     """End-to-end RMSE (output codes) vs the reference, mask off, exact model."""
     if codes is None:
-        codes = np.arange(8, 256, 4)
+        codes = EVAL_CODES
     fs = np.arange(0, 33) / 64.0
     errs = []
     for code in codes:
@@ -162,11 +182,29 @@ def rmse_exact(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
     return float(np.sqrt(np.mean(e * e)))
 
 
+def rmse_exact_rgb(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                   lut: np.ndarray, codes: np.ndarray | None = None) -> float:
+    """Channel-aware mask-off RMSE for references with RGB-specific grading."""
+    if codes is None:
+        codes = EVAL_CODES
+    fs = np.arange(0, 33) / 64.0
+    errs = []
+    for code in codes:
+        sim = simulate_flat_rgb(dark, bright, h, lut, int(code), fs)
+        x = int(code) / 255.0
+        target = np.array([[255.0 * _ref_vertical(ref, f, x, channel)
+                            for channel in "rgb"] for f in fs])
+        errs.append(sim - target)
+    e = np.concatenate(errs)
+    return float(np.sqrt(np.mean(e * e)))
+
+
 def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
                       lut: np.ndarray, tokens: list[list[str]],
                       mask_encoded: np.ndarray,
                       codes: np.ndarray | None = None,
-                      align: bool = True) -> tuple[float, float]:
+                      align: bool = True,
+                      mask_scale: int = 1) -> tuple[float, float]:
     """End-to-end RMSE THROUGH the mask: the only honest whole-pipeline metric.
 
     Mask-off RMSE silently assumes the port's mask equals the shader's mask, so
@@ -184,18 +222,55 @@ def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
     pattern has no anchor the viewer can see), so a fixed-phase comparison would
     reject a perfect port purely for starting on a different phosphor stripe.
 
+    `mask_scale` models MiSTer's 1x/2x mask mode.  In 2x mode each token is a
+    2x2 block of output pixels (shadowmask.sv indexes hcount[4:1]/vcount[4:1]).
+
     Returns (rmse, max_abs_err) in output codes.
+    """
+    rmse, max_err, _ = _rmse_exact_masked_periodic(
+        ref, dark, bright, h, lut, tokens, mask_encoded, codes=codes,
+        align=align, mask_scale=mask_scale)
+    return rmse, max_err
+
+
+def _rmse_exact_masked_periodic(
+        ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+        lut: np.ndarray, tokens: list[list[str]],
+        mask_encoded: np.ndarray, codes: np.ndarray | None = None,
+        align: bool = True, mask_scale: int = 1,
+) -> tuple[float, float, tuple[int, int]]:
+    """Exact masked metric over the complete periodic supercell.
+
+    The hardware and reference masks can have different periods (Royale is
+    12x6 in hardware versus 24x24 in the shader).  Comparing only the hardware
+    tile silently ignores reference cells outside its upper-left corner.  The
+    honest domain is lcm(period_hw, period_ref) on each axis.  Circular
+    correlation finds the best rigid reference-tile alignment without an
+    O(number_of_rolls * number_of_pixels) loop.
+
+    Returns (rmse, max_abs_err, best_reference_roll).
     """
     import fileio
     if codes is None:
-        codes = np.arange(8, 256, 4)
+        codes = EVAL_CODES
+    codes = np.asarray(codes, dtype=np.int64)
+    if mask_scale not in (1, 2):
+        raise ValueError(f"mask_scale must be 1 or 2, got {mask_scale}")
     fs = np.arange(0, 33) / 64.0
     h_tile, w_tile, _ = mask_encoded.shape
     mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
     m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)   # (h, w, 3)
+    if mask_scale == 2:
+        m16 = np.repeat(np.repeat(m16, 2, axis=0), 2, axis=1)
+    mh, mw, _ = m16.shape
+    super_h = int(np.lcm(mh, h_tile))
+    super_w = int(np.lcm(mw, w_tile))
     lines = np.empty(16, dtype=np.int64)
 
-    sims, bs = [], []
+    # Accumulate the exact spatial SSE for every rigid roll of the reference
+    # tile.  For P and T, ||P-roll(T)||^2 differs only in the cross term, which
+    # a 2-D circular correlation obtains for every roll at once.
+    sse = np.zeros((super_h, super_w), dtype=np.float64)
     for code in codes:
         x = int(code) / 255.0
         ctrl_in = int(lut[int(code)].max())
@@ -210,33 +285,66 @@ def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
             lines.fill(hout)
             per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
         v = np.stack(per_ch, axis=1)                             # (F, 3)
-        sims.append(np.stack([[mm.mask_multiply(v, m16[yy, xx][None, :])
-                               for xx in range(m16.shape[1])]
-                              for yy in range(m16.shape[0])]))    # (my, mx, F, 3)
-        bs.append(np.array([_ref_vertical_unclipped(ref, f, x) for f in fs]))
+        port = mm.mask_multiply(v[None, None, :, :], m16[:, :, None, :])
+        port = np.tile(port, (super_h // mh, super_w // mw, 1, 1))
 
-    rolls = ([(dy, dx) for dy in range(h_tile) for dx in range(w_tile)]
-             if align else [(0, 0)])
-    best = (np.inf, np.inf)
-    for dy, dx in rolls:
-        ref_tile = np.roll(mask_encoded, (dy, dx), axis=(0, 1))
-        errs = []
-        for sim, b in zip(sims, bs):
-            for yy in range(sim.shape[0]):
-                for xx in range(sim.shape[1]):
-                    tgt = 255.0 * np.minimum(
-                        b[:, None] * ref_tile[yy % h_tile, xx % w_tile][None, :], 1.0)
-                    errs.append(sim[yy, xx] - tgt)
-        e = np.concatenate([a.ravel() for a in errs])
-        cand = (float(np.sqrt(np.mean(e * e))), float(np.abs(e).max()))
-        if cand[0] < best[0]:
-            best = cand
-    return best
+        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
+                       for ch in "rgb"] for f in fs])
+        target = 255.0 * np.minimum(
+            mask_encoded[:, :, None, :] * b[None, None, :, :], 1.0)
+        target = np.tile(target,
+                         (super_h // h_tile, super_w // w_tile, 1, 1))
+
+        fp = np.fft.fft2(port, axes=(0, 1))
+        ft = np.fft.fft2(target, axes=(0, 1))
+        corr = np.fft.ifft2(fp * np.conj(ft), axes=(0, 1)).real
+        sse += ((port * port).sum() + (target * target).sum()
+                - 2.0 * corr.sum(axis=(2, 3)))
+
+    # The reference has only h_tile*w_tile unique rigid rolls even when the
+    # LCM supercell is larger than the reference period.
+    if align:
+        unique = sse[:h_tile, :w_tile]
+        dy, dx = np.unravel_index(int(np.argmin(unique)), unique.shape)
+    else:
+        dy, dx = 0, 0
+    count = len(codes) * super_h * super_w * len(fs) * 3
+    rmse = float(np.sqrt(max(sse[dy, dx], 0.0) / count))
+
+    # Re-simulate only the winning alignment to obtain the true L-infinity
+    # error; it cannot be recovered from the correlation sums.
+    max_err = 0.0
+    for code in codes:
+        x = int(code) / 255.0
+        ctrl_in = int(lut[int(code)].max())
+        lines.fill(ctrl_in)
+        hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+        ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+        per_ch = []
+        for c in range(3):
+            lines.fill(int(lut[int(code), c]))
+            hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+            lines.fill(hout)
+            per_ch.append(mm.fir_1d_adaptive(lines, dark, bright,
+                                              8.0 + fs, ctrl))
+        v = np.stack(per_ch, axis=1)
+        port = mm.mask_multiply(v[None, None, :, :], m16[:, :, None, :])
+        port = np.tile(port, (super_h // mh, super_w // mw, 1, 1))
+        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
+                       for ch in "rgb"] for f in fs])
+        target = 255.0 * np.minimum(
+            mask_encoded[:, :, None, :] * b[None, None, :, :], 1.0)
+        target = np.tile(target,
+                         (super_h // h_tile, super_w // w_tile, 1, 1))
+        target = np.roll(target, (dy, dx), axis=(0, 1))
+        max_err = max(max_err, float(np.abs(port - target).max()))
+    return rmse, max_err, (int(dy), int(dx))
 
 
 def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
                       bright: np.ndarray, tokens: list[list[str]],
-                      mask_encoded: np.ndarray, radius: int = 6) -> np.ndarray:
+                      mask_encoded: np.ndarray, radius: int = 6,
+                      channel_aware: bool = False) -> np.ndarray:
     """Model-in-the-loop LUT refinement for the GAIN-SPLIT path.
 
     refine_lut_exact minimizes the mask-OFF error, which for a gain-split build
@@ -250,19 +358,39 @@ def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
     h_tile, w_tile, _ = mask_encoded.shape
     mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
     m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
-    cells = [(m16[yy, xx], mask_encoded[yy % h_tile, xx % w_tile])
-             for yy in range(m16.shape[0]) for xx in range(m16.shape[1])]
+    mh, mw, _ = m16.shape
+
+    # Score the same complete periodic domain as rmse_exact_masked.  The old
+    # implementation paired only the upper-left hardware cell with the
+    # upper-left reference cell; that silently optimized the wrong target when
+    # the periods differ (notably Royale's 12x6 hardware tile versus its 24x24
+    # shader mask).  Freeze the current best rigid alignment for this LUT pass,
+    # then vectorize every LCM-supercell pairing.
+    _, _, (dy, dx) = _rmse_exact_masked_periodic(
+        ref, dark, bright, h, lut, tokens, mask_encoded)
+    super_h = int(np.lcm(mh, h_tile))
+    super_w = int(np.lcm(mw, w_tile))
+    mults = np.empty((super_h * super_w, 3), dtype=np.int64)
+    encoded = np.empty((super_h * super_w, 3), dtype=np.float64)
+    k = 0
+    for yy in range(super_h):
+        for xx in range(super_w):
+            mults[k] = m16[yy % mh, xx % mw]
+            encoded[k] = mask_encoded[(yy - dy) % h_tile,
+                                      (xx - dx) % w_tile]
+            k += 1
     lines = np.empty(16, dtype=np.int64)
     out = lut.copy()
     for code in range(256):
         x = code / 255.0
-        b = np.array([_ref_vertical_unclipped(ref, f, x) for f in fs])
-        targets = [255.0 * np.minimum(b[:, None] * enc[None, :], 1.0)
-                   for _, enc in cells]
+        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
+                       for ch in "rgb"] for f in fs])
+        targets = 255.0 * np.minimum(
+            b[None, :, :] * encoded[:, None, :], 1.0)
         base = lut[code].astype(np.int64)
-        best, best_err = base, np.inf
-        for delta in range(-radius, radius + 1):
-            cand = np.clip(base + delta, 0, 255)
+        best = base.copy()
+
+        def candidate_error(cand):
             lines.fill(int(cand.max()))
             hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
             ctrl = np.full(len(fs), hctrl, dtype=np.int64)
@@ -273,11 +401,37 @@ def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
                 lines.fill(hout)
                 per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
             v = np.stack(per_ch, axis=1)
-            err = 0.0
-            for (mult, _), tgt in zip(cells, targets):
-                err += float(((mm.mask_multiply(v, mult[None, :]) - tgt) ** 2).sum())
-            if err < best_err:
-                best, best_err = cand, err
+            sim = mm.mask_multiply(v[None, :, :], mults[:, None, :])
+            return float(((sim - targets) ** 2).sum())
+
+        if channel_aware:
+            # Coordinate descent over a true RGB LUT vector.  Kurozumi's warm
+            # black flare cannot be represented by the old scalar base+delta
+            # search, which forced every refined entry toward neutral gray.
+            best_err = candidate_error(best)
+            for _ in range(2):
+                changed = False
+                for ch in range(3):
+                    start = int(best[ch])
+                    local, local_err = best.copy(), best_err
+                    for value in range(max(0, start - radius),
+                                       min(255, start + radius) + 1):
+                        cand = best.copy()
+                        cand[ch] = value
+                        err = candidate_error(cand)
+                        if err < local_err:
+                            local, local_err = cand, err
+                    if local_err < best_err:
+                        best, best_err, changed = local, local_err, True
+                if not changed:
+                    break
+        else:
+            best_err = np.inf
+            for delta in range(-radius, radius + 1):
+                cand = np.clip(base + delta, 0, 255)
+                err = candidate_error(cand)
+                if err < best_err:
+                    best, best_err = cand, err
         out[code] = best
     for ch in range(3):
         out[:, ch] = np.maximum.accumulate(out[:, ch])
@@ -285,7 +439,8 @@ def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
 
 
 def refine_lut_exact(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
-                     bright: np.ndarray, radius: int = 6) -> np.ndarray:
+                     bright: np.ndarray, radius: int = 6,
+                     channel_aware: bool = False) -> np.ndarray:
     """Model-in-the-loop LUT refinement against the EXACT hardware arithmetic.
 
     optimize_lut works in ideal arithmetic, but MiSTer's FIR truncates: a
@@ -305,23 +460,61 @@ def refine_lut_exact(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
     out = lut.copy()
     for c in range(256):
         x = c / 255.0
-        target = np.array([255.0 * _ref_vertical(ref, f, x) for f in fs])
         base = lut[c].astype(np.int64)
-        best, best_err = base, np.inf
-        for delta in range(-radius, radius + 1):
-            cand = np.clip(base + delta, 0, 255)
-            g = int(cand[1])                       # green carries the compared level
+        best = base.copy()
+
+        if channel_aware:
+            target = np.array([[255.0 * _ref_vertical(ref, f, x, ch)
+                                for ch in "rgb"] for f in fs])
+        else:
+            target = np.array([255.0 * _ref_vertical(ref, f, x) for f in fs])
+
+        def candidate_error(cand):
             ctrl_in = int(cand.max())              # adaptive control = max RGB
-            lines.fill(g)
-            hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
             lines.fill(ctrl_in)
             hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
-            lines.fill(hout)
-            sim = mm.fir_1d_adaptive(lines, dark, bright, pos,
-                                     np.full(len(fs), hctrl, dtype=np.int64))
-            err = float(((sim - target) ** 2).sum())
-            if err < best_err:
-                best, best_err = cand, err
+            ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+            if channel_aware:
+                per_ch = []
+                for ch in range(3):
+                    lines.fill(int(cand[ch]))
+                    hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+                    lines.fill(hout)
+                    per_ch.append(mm.fir_1d_adaptive(
+                        lines, dark, bright, pos, ctrl))
+                sim = np.stack(per_ch, axis=1)
+            else:
+                lines.fill(int(cand[1]))
+                hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+                lines.fill(hout)
+                sim = mm.fir_1d_adaptive(lines, dark, bright, pos, ctrl)
+            return float(((sim - target) ** 2).sum())
+
+        if channel_aware:
+            best_err = candidate_error(best)
+            for _ in range(2):
+                changed = False
+                for ch in range(3):
+                    start = int(best[ch])
+                    local, local_err = best.copy(), best_err
+                    for value in range(max(0, start - radius),
+                                       min(255, start + radius) + 1):
+                        cand = best.copy()
+                        cand[ch] = value
+                        err = candidate_error(cand)
+                        if err < local_err:
+                            local, local_err = cand, err
+                    if local_err < best_err:
+                        best, best_err, changed = local, local_err, True
+                if not changed:
+                    break
+        else:
+            best_err = np.inf
+            for delta in range(-radius, radius + 1):
+                cand = np.clip(base + delta, 0, 255)
+                err = candidate_error(cand)
+                if err < best_err:
+                    best, best_err = cand, err
         out[c] = best
     for ch in range(3):
         out[:, ch] = np.maximum.accumulate(out[:, ch])
@@ -463,7 +656,7 @@ def fit_v_adaptive_gain(ref, lut: np.ndarray, gain: float,
     entirely by the LUT, so rows never need over-unity gain and never clip).
     """
     if xs is None:
-        xs = np.arange(8, 256, 4) / 255.0
+        xs = EVAL_CODES / 255.0
     lums = np.array([lut[int(round(x * 255))].max() for x in xs], dtype=np.int64)
     rows = np.zeros((129, len(xs), 4))
     for p in range(129):
@@ -544,7 +737,7 @@ def fit_v_adaptive(ref, lut_ctrl: np.ndarray,
     then cap row sums at 256 and quantize with exact symmetry.
     """
     if xs is None:
-        xs = np.arange(8, 256, 4) / 255.0
+        xs = EVAL_CODES / 255.0
     rows, lums = _tap_targets(ref, lut_ctrl, xs)
     ta = (256.0 - lums) / 256.0
     tb = lums / 256.0
@@ -671,6 +864,57 @@ def fit_v_joint_safe(ref, channels: bool = False, limit: float = 255.5,
     return lut, dark, bright, {"cap_bright": caps[-1], "worst_flat": worst}
 
 
+def fit_v_for_lut_safe(ref, lut: np.ndarray, limit: float = 255.5,
+                       caps=(256.0, 252.0, 248.0, 244.0, 240.0, 232.0)
+                       ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Fit adaptive V endpoints for a fixed, caller-supplied gamma LUT.
+
+    This is the correct path for a real ``gamma=off`` preset.  Reusing tables
+    co-optimized with a nonlinear LUT changes both the carried pixel level and
+    the max-RGB adaptive control, so it is only a rough fallback.  With the LUT
+    fixed, the exact flat-field model remains linear in the endpoint row sums::
+
+        out(f,x) = A_f * (v-v^2) + B_f * v^2,  v=LUT(x)/256
+
+    We solve those sums directly in output-code space, apply the shader's beam
+    shapes, quantize with exact conjugate symmetry, and measure (rather than
+    assume) the no-flat-field-clipping invariant.
+    """
+    xs_i = EVAL_CODES
+    xs = xs_i / 255.0
+    fs = np.arange(0, 33) / 64.0
+    O = np.array([[255.0 * _ref_vertical(ref, f, x) for x in xs] for f in fs])
+    g = lut[xs_i].max(axis=1).astype(np.int64)
+    shapes = _endpoint_shapes(ref)
+    cap_a129 = np.minimum(511.0 / np.maximum(shapes[0].max(axis=1), 1e-9),
+                         2044.0)
+    cap_a = np.interp(fs, np.arange(129) / 256.0, cap_a129)
+
+    last = None
+    for cap_bright in caps:
+        A, B = _solve_ab(O, g, cap_a, np.full(len(fs), cap_bright),
+                         n=97, refine=7)
+        tables = []
+        for sums33, shape in ((A, shapes[0]), (B, shapes[1])):
+            sums129 = np.interp(np.arange(129) / 256.0, fs, sums33)
+            fl = np.zeros((PHASES, 4))
+            fl[:129] = sums129[:, None] * shape
+            for p in range(129, PHASES):
+                fl[p] = fl[PHASES - p][::-1]
+            fl = np.clip(fl, 0, None)
+            target_sums = np.round(fl.sum(axis=1)).astype(np.int64)
+            for p in range(1, 128):
+                target_sums[PHASES - p] = target_sums[p]
+            tables.append(quantize.quantize_symmetric(fl, target_sums))
+        dark, bright = tables
+        worst = worst_flat_field_output(lut, dark, bright)
+        last = (dark, bright, {"cap_bright": cap_bright,
+                               "worst_flat": worst})
+        if worst <= limit:
+            return last
+    return last
+
+
 def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
                 iters: int = 25, channels: bool = False,
                 seed: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -700,7 +944,7 @@ def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
     Returns (lut, dark_table, bright_table).
     """
     if xs is None:
-        xs = np.arange(8, 256, 4) / 255.0
+        xs = EVAL_CODES / 255.0
     xs_i = np.round(xs * 255).astype(int)
     fs = np.arange(0, 33) / 64.0
     O = np.array([[255.0 * _ref_vertical(ref, f, x) for x in xs] for f in fs])
@@ -752,7 +996,11 @@ def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
 
     gf = np.interp(np.arange(256), xs_i, g)
     gf = np.maximum.accumulate(np.clip(np.round(gf), 0, 255))
-    gf[0] = 0
+    # Do not erase a deliberate lifted black.  Kurozumi's grade pass has a
+    # warm channel-dependent flare at code 0; zero is only a required anchor
+    # for references whose own black is actually zero.
+    if max(_transfer(ref, 0.0, c) for c in "rgb") <= 1e-9:
+        gf[0] = 0
     lut = np.zeros((256, 3), dtype=np.int64)
     for c, name in enumerate("rgb"):
         if channels:
@@ -773,16 +1021,120 @@ def worst_flat_field_output(lut: np.ndarray, dark: np.ndarray,
     endpoint's row sum against 256 is the wrong invariant: the hardware clips
     on the BLENDED row, and the dark set's weight vanishes where the level is
     high, so an over-unity dark row is harmless while a legal-looking pair can
-    still clip.
+    still clip.  Each RGB signal channel is tested against the shared max-RGB
+    adaptive control, which matters for Kurozumi's channel-specific LUT.
     """
     worst = 0.0
     phases = np.arange(256)
     for xi in range(256):
-        g = int(lut[xi, 1])
+        ctrl = int(lut[xi].max())
         c128 = mm.adaptive_c128(dark, bright, phases,
-                                np.full(256, g, dtype=np.int64))
-        worst = max(worst, float((g * c128.sum(axis=1) / 32768.0).max()))
+                                np.full(256, ctrl, dtype=np.int64))
+        row_sums = c128.sum(axis=1)
+        for signal in lut[xi]:
+            worst = max(
+                worst, float((int(signal) * row_sums / 32768.0).max()))
     return worst
+
+
+def stabilize_adaptive_selector(dark: np.ndarray, bright: np.ndarray,
+                                radius: int = 8,
+                                strength: float = 1.0
+                                ) -> tuple[np.ndarray, np.ndarray]:
+    """Regularize endpoint sets around the nearest-line selector boundary.
+
+    MiSTer's adaptive control samples the nearest source line, so at phase 128
+    it can jump from the upper line's luminance to the lower line's luminance.
+    Very different endpoint rows turn an ordinary dark/light edge into a large
+    one-pixel discontinuity (over 100 codes in the old Royale table), a defect
+    no flat-field objective can observe.
+
+    Around the half-phase boundary, smoothly pull both sets toward their common
+    midpoint.  This preserves their average response, exact phase conjugacy,
+    signed-10-bit range, and full adaptation away from the selector switch.
+    ``radius`` is measured in the 256-phase table; zero returns exact copies.
+    """
+    if radius < 0 or radius > 128:
+        raise ValueError("radius must be in 0..128")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("strength must be in 0..1")
+    d = np.asarray(dark, dtype=np.float64).copy()
+    b = np.asarray(bright, dtype=np.float64).copy()
+    if d.shape != (PHASES, 4) or b.shape != (PHASES, 4):
+        raise ValueError("adaptive tables must both have shape (256, 4)")
+    if radius == 0 or strength == 0.0:
+        return d.astype(np.int64), b.astype(np.int64)
+
+    for p in range(129):
+        dist = abs(128 - p)
+        if dist > radius:
+            continue
+        # Raised cosine: full regularization at p=128, zero value and slope at
+        # the edge of the transition band.
+        w = strength * 0.5 * (1.0 + np.cos(np.pi * dist / radius))
+        common = 0.5 * (d[p] + b[p])
+        d[p] = (1.0 - w) * d[p] + w * common
+        b[p] = (1.0 - w) * b[p] + w * common
+    for p in range(129, PHASES):
+        d[p] = d[PHASES - p][::-1]
+        b[p] = b[PHASES - p][::-1]
+    return np.rint(d).astype(np.int64), np.rint(b).astype(np.int64)
+
+
+def blend_adaptive_endpoints(dark: np.ndarray, bright: np.ndarray,
+                             strength: float
+                             ) -> tuple[np.ndarray, np.ndarray]:
+    """Globally reduce adaptation while preserving its mean beam response.
+
+    This is the display-safe companion to ``stabilize_adaptive_selector``.
+    Some very narrow beams become unstable at fractional vertical scales when
+    only phases around the nearest-line selector are regularized.  Pulling the
+    two endpoint tables toward their common midpoint at every phase trades
+    brightness-dependent beam variation for a bounded selector transition and
+    materially lower moire.  ``strength=0`` is an exact copy; ``1`` collapses
+    both sets to the same fixed profile.
+    """
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("strength must be in 0..1")
+    d = np.asarray(dark, dtype=np.float64)
+    b = np.asarray(bright, dtype=np.float64)
+    if d.shape != (PHASES, 4) or b.shape != (PHASES, 4):
+        raise ValueError("adaptive tables must both have shape (256, 4)")
+    common = 0.5 * (d + b)
+    ds = np.rint((1.0 - strength) * d + strength * common).astype(np.int64)
+    bs = np.rint((1.0 - strength) * b + strength * common).astype(np.int64)
+    # Rounding each endpoint independently can differ by one between conjugate
+    # phases.  Reassert the exact stored-table invariants after quantization.
+    for p in range(1, 128):
+        ds[PHASES - p] = ds[p][::-1]
+        bs[PHASES - p] = bs[p][::-1]
+    ds[128] = np.rint(0.5 * (ds[128] + ds[128][::-1])).astype(np.int64)
+    bs[128] = np.rint(0.5 * (bs[128] + bs[128][::-1])).astype(np.int64)
+    return ds, bs
+
+
+def blend_dark_toward_bright(dark: np.ndarray, bright: np.ndarray,
+                             strength: float
+                             ) -> tuple[np.ndarray, np.ndarray]:
+    """Reduce adaptation without importing high-gain dark rows into highlights.
+
+    This one-sided form is useful for Royale: its dark endpoint legally exceeds
+    unity because the dark control weight vanishes in highlights.  A symmetric
+    midpoint blend moves those large rows into the bright endpoint and clips;
+    moving only dark toward the already-safe bright table bounds selector jumps
+    while retaining the original highlight response and clip safety.
+    """
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("strength must be in 0..1")
+    d = np.asarray(dark, dtype=np.float64)
+    b = np.asarray(bright, dtype=np.int64).copy()
+    if d.shape != (PHASES, 4) or b.shape != (PHASES, 4):
+        raise ValueError("adaptive tables must both have shape (256, 4)")
+    ds = np.rint((1.0 - strength) * d + strength * b).astype(np.int64)
+    for p in range(1, 128):
+        ds[PHASES - p] = ds[p][::-1]
+    ds[128] = np.rint(0.5 * (ds[128] + ds[128][::-1])).astype(np.int64)
+    return ds, b
 
 
 def fit_v_fixed(ref, lut_ctrl: np.ndarray, xs: np.ndarray | None = None,
@@ -793,7 +1145,7 @@ def fit_v_fixed(ref, lut_ctrl: np.ndarray, xs: np.ndarray | None = None,
     produces a better table by choosing its own LUT.
     """
     if xs is None:
-        xs = np.arange(8, 256, 4) / 255.0
+        xs = EVAL_CODES / 255.0
     rows, _ = _tap_targets(ref, lut_ctrl, xs)
     w = np.ones(len(xs)) if weights is None else weights
     w = w / w.sum()
@@ -825,7 +1177,7 @@ def fit_v_fixed_paired(ref, channels: bool = False,
 
     Returns (fixed table, (256, 3) LUT).
     """
-    xs = np.arange(8, 256, 4) / 255.0
+    xs = EVAL_CODES / 255.0
     fs = np.arange(0, 129) / 256.0
     O = np.array([[_ref_vertical(ref, f, x) for x in xs] for f in fs])   # (129, NX)
 
@@ -1094,26 +1446,34 @@ def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
 
     Per output cell this is a search over all 7*16*16 tokens scored through the
     exact mask arithmetic against the real simulated pre-mask output — cheap,
-    and exact rather than a heuristic. `dither_group`: cells xx, xx+group, ...
-    are repeats of one target column, so their MEAN is what must match.
+    and exact rather than a heuristic.  Hardware and shader mask periods need
+    not match, so every candidate is scored over their complete LCM supercell;
+    fitting only the upper-left hardware-sized crop can choose a token that is
+    badly wrong everywhere the shorter hardware tile repeats.
+
+    `dither_group`: cells xx, xx+group, ... are perceptual dither partners, so
+    their MEAN is fitted to the mean of every reference cell they cover.
     Returns (tokens, masked rmse).
     """
     import fileio
     if codes is None:
-        codes = np.arange(8, 256, 4)
+        codes = EVAL_CODES
     fs = np.arange(0, 33) / 64.0
     h_tile, w_tile, _ = mask_encoded.shape
     rows, cols = len(tokens), len(tokens[0])
     group = dither_group or cols
+    super_h = int(np.lcm(rows, h_tile))
+    super_w = int(np.lcm(cols, w_tile))
 
     # Pre-mask simulated output and the shader's pre-clip beam, per level.
     sims, beams = [], []
     for code in codes:
         sims.append(simulate_flat_rgb(dark, bright, h, lut, int(code), fs))
-        beams.append(np.array([_ref_vertical_unclipped(ref, f, int(code) / 255.0)
-                               for f in fs]))
+        beams.append(np.array([[
+            _ref_vertical_unclipped(ref, f, int(code) / 255.0, ch)
+            for ch in "rgb"] for f in fs]))
     V = np.stack(sims)                                   # (NC, F, 3)
-    B = np.stack(beams)                                  # (NC, F)
+    B = np.stack(beams)                                  # (NC, F, 3)
 
     names, resp = [], []
     for bm in range(1, 8):
@@ -1126,26 +1486,55 @@ def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
                                              m16[None, :]).reshape(V.shape))
     R = np.stack(resp).astype(np.float64)                # (NT, NC, F, 3)
 
+    flat = R.reshape(len(names), -1)
+    r2 = (flat * flat).sum(axis=1)
+    gram = flat @ flat.T
     out = [list(r) for r in tokens]
-    for yy in range(rows):
-        for xx in range(group):
-            members = list(range(xx, cols, group))
-            tgt = 255.0 * np.minimum(
-                B[:, :, None] * mask_encoded[yy % h_tile, xx % w_tile][None, None, :], 1.0)
-            if len(members) == 1:
-                err = ((R - tgt[None]) ** 2).sum(axis=(1, 2, 3))
-                out[yy][members[0]] = names[int(np.argmin(err))]
-            else:
-                # Dithered: pick the pair whose MEAN response fits best.
-                flat = R.reshape(len(names), -1)
-                t = tgt.ravel()
-                a = 0.25 * (flat * flat).sum(axis=1) - flat @ t
-                G = flat @ flat.T
-                e = a[:, None] + a[None, :] + 0.5 * G + float(t @ t)
-                i, j = np.unravel_index(int(np.argmin(e)), e.shape)
-                for k, mi in enumerate(members):
-                    out[yy][mi] = names[i if k % 2 == 0 else j]
-    r, _ = rmse_exact_masked(ref, dark, bright, h, lut, out, mask_encoded)
+
+    # Token choices can change the best rigid mask alignment.  Two alternating
+    # alignment/refit passes are deterministic and sufficient for these small
+    # periodic tiles; a third is retained as a convergence check.
+    for _ in range(3):
+        _, _, (dy, dx) = _rmse_exact_masked_periodic(
+            ref, dark, bright, h, lut, out, mask_encoded, codes=codes)
+        previous = [list(r) for r in out]
+        for yy in range(rows):
+            for xx in range(group):
+                members = list(range(xx, cols, group))
+                mults = []
+                for sy in range(yy, super_h, rows):
+                    for sx in range(super_w):
+                        if sx % cols in members:
+                            # Evaluator convention: np.roll(reference, (dy,dx)),
+                            # hence output (sy,sx) sees unrolled cell (sy-dy,sx-dx).
+                            mults.append(mask_encoded[(sy - dy) % h_tile,
+                                                      (sx - dx) % w_tile])
+                mults = np.asarray(mults, dtype=np.float64)
+                targets = 255.0 * np.minimum(
+                    B[None, :, :, :] * mults[:, None, None, :], 1.0)
+
+                if len(members) == 1:
+                    # Sum_k ||R-T_k||^2 from sufficient statistics, avoiding a
+                    # large (tokens x congruent-cells x levels x phases x RGB)
+                    # temporary for every hardware cell.
+                    tsum = targets.sum(axis=0).ravel()
+                    err = (len(mults) * r2 - 2.0 * (flat @ tsum)
+                           + float((targets * targets).sum()))
+                    out[yy][members[0]] = names[int(np.argmin(err))]
+                else:
+                    # Dither partners are deliberately integrated by the eye;
+                    # fit their mean response to the mean target over every
+                    # reference cell those hardware columns cover.
+                    t = targets.mean(axis=0).ravel()
+                    a = 0.25 * r2 - flat @ t
+                    e = a[:, None] + a[None, :] + 0.5 * gram + float(t @ t)
+                    i, j = np.unravel_index(int(np.argmin(e)), e.shape)
+                    for k, mi in enumerate(members):
+                        out[yy][mi] = names[i if k % 2 == 0 else j]
+        if out == previous:
+            break
+    r, _ = rmse_exact_masked(
+        ref, dark, bright, h, lut, out, mask_encoded, codes=codes)
     return out, r
 
 
