@@ -1,0 +1,251 @@
+====================================================================
+ MAXIMUM-FIDELITY AUDIT - MiSTer CRT Easymode / CRT Lottes Ports
+====================================================================
+
+Audit completed: 2026-07-16
+Edition: v4 maximum-fidelity
+Reference MiSTer Main: 7317947f41f6d085444ff00d297896aba2041ca0
+Reference MiSTer Template: 6d29ac7ca3c721792a72e30393357c57fb7f8f1b
+Reference libretro shaders: 2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
+
+
+BOTTOM LINE
+-----------
+Portable MiSTer filter/gamma/mask files cannot be absolutely identical to the
+source GLSL. MiSTer has no programmable fragment stage: its portable path is a
+pre-scaler gamma LUT, optional core scanline logic, one horizontal and one
+vertical four-tap FIR, then a quantised HDMI shadow mask. The shaders require
+nonlinear and neighbourhood-dependent operations after filtering.
+
+This edition implements every high-value representable improvement found in a
+second independent math and RTL audit. It is materially closer than v3 while
+retaining conservative and non-adaptive fallbacks.
+
+
+V4 IMPROVEMENTS
+---------------
+1. Easymode gain now clips later
+
+   The recommended Matched LUT is now only:
+
+     round(255 * input^(2/1.8))
+
+   Its remaining scalar compensation is applied in the last scaler axis rather
+   than before H filtering. Non-clipped uniform math is preserved, while bright
+   Lanczos edges survive the H-stage 8-bit clamp. TATE uses separately boosted H
+   tables in the hardware V slot so gain still occurs at the last scaler stage.
+
+
+2. Easymode adaptive rows are fitted directly, phase by phase
+
+   The old adaptive table interpolated two nominal scan_bright states. The new
+   table fits both endpoint sums independently for every phase over RGB colours,
+   using the actual unboosted gamma control, MiSTer's max-RGB adaptation, stage
+   clamps and shift/add 42f mask. It better approximates the shader's
+   (max+luma)/2 brightness response without claiming those endpoint rows are
+   literal shader parameter states.
+
+   Deterministic hardware-model RGB-lattice RMSE: 4.010 output codes.
+
+
+3. Correct >=400-line Easymode path added
+
+   The shader disables scan attenuation at InputSize.y >= 400 but still applies
+   SHARPNESS_V=1 half-circle vertical interpolation. Previous advice to use the
+   H filter vertically substituted a Lanczos kernel and was wrong. New base and
+   Matched No Scanlines tables plus landscape/TATE presets implement the correct
+   path. Landscape presets also use it explicitly for interlaced fallback.
+
+
+4. Hardware-fitted Highlights rebuilt
+
+   Highlights is regenerated against saturated-white source targets and
+   shadowmask.sv's real shift/add/truncate arithmetic. It is now paired with the
+   late-boost Matched gamma/mask layout instead of the old preboost factorisation.
+
+   Weighted saturated-white RMSE is 6.597 codes. The remaining error is the
+   hard 93.75% ceiling for inactive channels in MiSTer's v2 mask encoding.
+
+
+5. Exact stored-phase symmetry enforced
+
+   For phases 1..127, phase 256-i is the exact tap reversal of phase i. Phase
+   128 is self-symmetric. This removes one-coefficient directional bias at the
+   frequently used half phase. A midpoint row may differ from ideal DC by at
+   most one coefficient unit when exact symmetry and an odd target sum conflict.
+
+
+6. Optional Easymode pixel-art anti-ringing approximation added
+
+   The source clamp is nonlinear and cannot be a fixed FIR. The optional H
+   table is a DC-constrained least-squares fit over all 16 binary four-pixel
+   neighbourhoods. It substantially reduces hard-edge ringing while the
+   canonical H remains the continuous-tone/source-kernel default.
+
+   Quantised binary-neighbourhood RMSE: 0.040554 -> 0.021246
+   (47.6% reduction).
+
+
+7. Lottes' enabled-by-default bloom is now represented
+
+   Canonical crt-lottes compiles with DO_BLOOM. The old port was a sound crisp
+   no-bloom approximation but not the source default. The new source-default H
+   blends 16.3618283% of H7(-1.5) into H5(-3). V is least-squares fitted to
+   Tri + 0.15*Bloom and constrained to preserve the source flat-field gain.
+
+   Results:
+
+     Four-tap bloom support retained:             at least 98.835%
+     Omitted halo contribution to total:          at most 0.175%
+     Constrained 4x4 spatial relative error:      about 1.8%
+
+   The prior pair is retained as CRT Lottes Crisp (Port)_H/V.
+
+
+8. Lottes mask and V gain are now jointly matched
+
+   New 47e/27e/17e masks use selected/other multipliers of 23/16 and 14/16.
+   Their ratio closely matches the encoded equivalent of Lottes' linear-light
+   1.5/0.5 mask. The coupled V tables reduce gain so the complete pair, not the
+   mask alone, matches the source. Hardware shift truncation is modelled.
+
+   Exact generated-table evaluation on the deterministic RGB fitting lattice,
+   using MiSTer's adaptive interpolation, FIR truncation, 8-bit clamps and mask
+   shifts, gives these flat-field results against the full bloom-enabled source:
+
+     Matched adaptive RMSE:                        1.818 codes
+     Matched fixed RMSE:                           1.833 codes
+     Retained crisp/no-bloom profile RMSE:        12.908 codes
+     Matched adaptive maximum channel error:       6.782 codes
+
+   These figures isolate uniform colour/scan/mask transfer; the separate 1.8%
+   spatial-kernel result measures non-uniform structure. The adaptive version is
+   the closest, while fixed is within about 1% and works on non-adaptive cores.
+
+
+9. TATE/interlace presets corrected
+
+   Main falls back to the H slot for interlaced video when ifilter is disabled.
+   In a TATE preset that slot contains the rotated scan profile, so ifilter=same
+   was incorrect. Every TATE preset now names an explicit last-axis filter.
+
+
+10. Double-scanline setup hazard documented
+
+   A core's Scandoubler Fx / Scanlines logic runs before ascal. It must be Off
+   when using these profiles; otherwise scanlines are applied twice and the
+   adaptive control signal is altered before the fitted table sees it.
+
+
+WHAT STILL CANNOT BE MADE IDENTICAL
+-----------------------------------
+Easymode:
+
+  - local min/max anti-ringing clamp;
+  - exact nonlinear transfer and boost after both filter axes;
+  - exact (max RGB + Rec.709 luma)/2 brightness control;
+  - mask before output gamma;
+  - automatic source-height cutoff.
+
+Lottes:
+
+  - exact linear-light edge mixing and piecewise-sRGB output;
+  - nonseparable 7x5 Tri/Bloom with H3/H5/H7 selected by line;
+  - curvature, border/off-screen treatment;
+  - linear-light shadow mask before sRGB.
+
+MiSTer-wide constraints:
+
+  - four taps per separable axis;
+  - one shared adaptive table/control path, so H and V cannot both adapt;
+  - 8-bit intermediate clamping and 10-bit coefficients;
+  - 1/16-step mask multipliers implemented by truncated shifts;
+  - no post-scaler gamma LUT and no shader-program file format.
+
+
+VALIDATION SCOPE
+----------------
+The completed package is checked for:
+
+  - 256 phases per set and exactly two equal sets for adaptive files;
+  - signed 10-bit coefficient range;
+  - conjugate phase pairs and self-symmetric phase 128;
+  - Main-compatible 64/16-phase downsampling;
+  - 256 monotonic gamma entries;
+  - v2 mask dimensions, rows and tokens;
+  - exact case-sensitive preset references and all seven supported fields;
+  - explicit interlace fallbacks for landscape and TATE;
+  - ZIP integrity and byte-identical extraction.
+
+Final inventory: 20 filter files, 2 gamma LUTs, 8 shadow masks and 19 presets.
+
+This is mathematical/RTL validation. Final preference still depends on panel
+EOTF, viewing distance and phosphor-pitch taste; no physical MiSTer/display A/B
+test was available in this environment.
+
+See README.txt for installation and profile selection, and SOURCES.txt for
+source hashes, licensing and implementation references.
+
+
+====================================================================
+ V5 AUDIT (2026-07-17) - GUEST ADVANCED / ROYALE / KUROZUMI PORTS
+====================================================================
+
+METHOD
+------
+Each shader's default-parameter math was extracted from pinned sources into
+a validated Python reference implementation (13-26 hand-computed checks per
+shader against the quoted GLSL/slang code). MiSTer's arithmetic was
+re-verified at RTL level and modeled exactly (tools/mister_model.py):
+truncating pair-sum FIR with per-axis 8-bit clamps, adaptive lerp with its
+1-bit truncation and 255/256 bright-set ceiling, per-set-bit truncated
+shift/add mask multipliers. Tables were fitted per phase by least squares
+against the references (tools/fitting.py), with the gamma LUT co-optimized
+against the adaptive endpoint fit under the constraint LUT >= beam-center
+transfer, which guarantees every V row <= unity (no scaler clipping,
+anywhere, by construction). Full pipeline (tools/) is kept in the pack.
+
+RESULTS (exact-model simulation vs reference, mask off, f x gray-ramp grid)
+--------------------------------------------------------------------------
+  CRT Guest Advanced   RMSE  3.21 codes (max 24.1)   moire worst-std 1.94
+  CRT Royale           RMSE 15.92 codes (max 109.4)  moire worst-std 7.14
+  CRT Royale Kurozumi  RMSE 12.03 codes (max 62.4)   moire worst-std 5.74
+  (v4 benchmarks: Lottes 1.8, Easymode 4.0; moire guard <= 7.65 codes;
+   fixed-fallback tables are coarser by design: 7.3 / 38.4 / 26.2)
+
+Flat-field brightness parity at x = 0.25 / 0.5 / 0.75 (masked): within
++-4.4 codes for all three shaders. At x = 1.0: Guest -16, Royale -61,
+Kurozumi -33 codes — see irreducible limits below.
+
+CLIPPING: max V row sum is exactly 256 in every table (audited).
+
+IRREDUCIBLE LIMITS (concentrations of the RMSE)
+-----------------------------------------------
+1. Royale's white bloom-fill: scanline depth vs brightness is non-monotone
+   (deep through mids, near-flat at white). A two-endpoint linear blend in
+   the post-LUT code cannot represent that reversal; a weighting study
+   (uniform / bright-weighted / extremes / mid-weighted) shifted but never
+   removed the error, and pinning the bright endpoint to white-flat
+   destroys mid-tone scanlines entirely. The shipped fit keeps mids
+   faithful and leaves mild scanlines on near-white flat fields.
+2. Kurozumi's LUT saturation: its transfer reaches 1.0 near x = 0.74
+   (faithful - the shader clips there too), so above that level the
+   adaptive control cannot distinguish inputs and trough differences in
+   the top quarter collapse to one profile.
+3. Kurozumi's mask: the rendered 2-px grille needs per-pixel triples
+   (1.34, 1.01, 0.55) encoded; v2 tokens give the two non-selected
+   channels one shared value. Luma-weighted fit preserves the R ripple
+   and average luma; the B ripple flattens (token rmse 0.104).
+4. Royale's mask: the 24x24 rendered slot tile exceeds the 16x16 hardware
+   mask; best divisor-periodic fit is 12x3 (period rmse 0.117). Non-divisor
+   periods were rejected: they score better inside one tile but beat
+   against the pattern when repeated across the screen.
+
+Also unrepresentable (documented in tools/DESIGN.md and the reference
+notes): royale/kurozumi misconvergence and halation/diffusion spatial
+spread, guest's chroma-dependent beam narrowing, anti-ring clamps,
+linear-light vs encoded filtering order, curvature.
+
+As with v4: mathematical/RTL validation only; no physical A/B on this
+machine. The 1080p moire guard passes for all shipped adaptive tables at
+4.5x and 4.821x; vscale_mode=1 is recommended for Kurozumi regardless.

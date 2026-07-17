@@ -1,0 +1,9 @@
+####
+# Name: CRT Lottes Matched Mask 2 - Aperture Grille
+# Original shader: Timothy Lottes; MiSTer maximum-fidelity matched port
+# Type: CRT
+# Pair only with a Lottes Matched Bloom V filter: selected 143.75%, others 87.5%
+####
+v2
+3,1
+47e,27e,17e

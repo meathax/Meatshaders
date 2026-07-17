@@ -1,0 +1,9 @@
+####
+# Name: CRT Royale Kurozumi (Port)
+# crt-royale-kurozumi (P22/PVM preset over crt-royale); libretro/slang-shaders @ 3b0d6aa1d134
+# Encoded-space fit of the shader mask as rendered at 1080p (token rmse 0.104)
+# Pair with the matching (Port) gamma and V filters
+####
+v2
+2,1
+45f,319

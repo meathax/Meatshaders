@@ -1,0 +1,10 @@
+####
+# Name: CRT Easymode Matched Boost (Port)
+# Original shader: Easymode; MiSTer fixed-pipeline matched approximation
+# Type: CRT
+# Must be paired with Gamma/CRT Easymode Matched (Port).txt
+# Moves most BRIGHT_BOOST after scaling: selected 112.5%, others 93.75%
+####
+v2
+3,1
+42f,22f,12f

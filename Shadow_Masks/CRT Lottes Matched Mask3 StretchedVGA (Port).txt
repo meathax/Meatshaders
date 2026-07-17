@@ -1,0 +1,10 @@
+####
+# Name: CRT Lottes Matched Mask 3 - Stretched VGA (DEFAULT)
+# Original shader: Timothy Lottes; MiSTer maximum-fidelity matched port
+# Type: CRT
+# Pair only with a Lottes Matched Bloom V filter
+####
+v2
+6,2
+47e,47e,27e,27e,17e,17e
+27e,17e,17e,47e,47e,27e

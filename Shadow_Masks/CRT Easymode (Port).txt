@@ -1,0 +1,9 @@
+####
+# Name: CRT Easymode (Port)
+# Original shader: Easymode; MiSTer fixed-pipeline port
+# Type: CRT
+# MASK_STRENGTH=0.3; nearest 1/16-step output-gamma compensation
+####
+v2
+3,1
+40d,20d,10d

@@ -1,0 +1,9 @@
+####
+# Name: CRT Guest Advanced (Port)
+# crt-guest-advanced (guest.r); libretro/slang-shaders @ 3b0d6aa1d134
+# Encoded-space fit of the shader mask as rendered at 1080p (token rmse 0.009)
+# Pair with the matching (Port) gamma and V filters
+####
+v2
+2,1
+50e,20e

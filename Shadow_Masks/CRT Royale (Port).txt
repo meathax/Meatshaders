@@ -1,0 +1,20 @@
+####
+# Name: CRT Royale (Port)
+# crt-royale (TroggleMonkey); libretro/slang-shaders @ 3b0d6aa1d134
+# Encoded-space fit of the shader mask as rendered at 1080p (token rmse 0.067)
+# Pair with the matching (Port) gamma and V filters
+####
+v2
+3,12
+496,2aa,195
+495,29a,195
+4a6,2ab,1a5
+485,29a,185
+4a6,2ab,1a5
+495,29a,195
+495,29a,195
+4a6,2ab,1a5
+485,29a,185
+4a6,2ab,1a5
+495,29a,195
+495,2aa,195
