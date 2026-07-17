@@ -149,11 +149,20 @@ def build(key: str) -> None:
             r, _ = fitting.rmse_exact_masked(ref, dark, bright, h, lut, tokens, m_target)
             print(f"[{key}] refine pass {it + 1}: masked RMSE {r:.3f} codes")
     else:
-        lut = fitting.optimize_lut(ref, channels=cfg["lut_channels"])
-        dark, bright = fitting.fit_v_adaptive(ref, lut.max(axis=1))
-        for it in range(3):
-            lut = fitting.refine_lut_exact(ref, lut, h, dark, bright)
-            dark, bright = fitting.fit_v_adaptive(ref, lut.max(axis=1))
+        # Joint (warp, endpoint row-sum) fit. It supersedes optimize_lut +
+        # fit_v_adaptive: those fit in row-sum space (an implicit 1/u^2 output
+        # weighting) under a rows<=256 cap that is a far too strong proxy for
+        # "no scaler clipping". Clip-safety is now measured, not assumed.
+        lut, dark, bright, jinfo = fitting.fit_v_joint_safe(
+            ref, channels=cfg["lut_channels"])
+        print(f"[{key}] joint fit: RMSE {rmse_exact(ref, dark, bright, h, lut):.3f} "
+              f"codes (mask off), bright cap {jinfo['cap_bright']:.0f}, "
+              f"worst flat-field {jinfo['worst_flat']:.1f}/255")
+        for it in range(2):
+            lut2 = fitting.refine_lut_exact(ref, lut, h, dark, bright)
+            if fitting.worst_flat_field_output(lut2, dark, bright) > 255.5:
+                break                      # refinement must not break clip-safety
+            lut = lut2
             print(f"[{key}] refine pass {it + 1}: RMSE "
                   f"{rmse_exact(ref, dark, bright, h, lut):.3f} codes (mask off)")
 

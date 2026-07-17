@@ -573,6 +573,218 @@ def fit_v_adaptive(ref, lut_ctrl: np.ndarray,
     return tables[0], tables[1]
 
 
+def _endpoint_shapes(ref, l_dark: float = 0.15, l_bright: float = 1.0) -> np.ndarray:
+    """(2, 129, 4) normalized 4-tap beam shapes per phase for both endpoints."""
+    sh = np.zeros((2, 129, 4))
+    for j, L in enumerate((l_dark, l_bright)):
+        for p in range(129):
+            f = p / 256.0
+            d = np.array([f + 1.0, f, 1.0 - f, 2.0 - f])
+            w = np.array([max(ref.beam_weight(di, L), 0.0) for di in d])
+            if w.sum() < 1e-12:
+                w = np.zeros(4)
+                w[np.argmin(d)] = 1.0
+            sh[j, p] = w / w.sum()
+    return sh
+
+
+def _joint_features(g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    v = np.asarray(g, dtype=np.float64) / 256.0
+    return v - v * v, v * v
+
+
+def _solve_ab(O: np.ndarray, g: np.ndarray, cap_a: np.ndarray, cap_b: np.ndarray,
+              n: int = 49, refine: int = 5) -> tuple[np.ndarray, np.ndarray]:
+    """Per-phase box-constrained 2-var fit. The clip makes it non-convex, so
+    use a vectorized 2-D zoom grid rather than a normal-equation solve."""
+    p, q = _joint_features(g)
+    nf = O.shape[0]
+    lo_a, hi_a = np.zeros(nf), cap_a.copy()
+    lo_b, hi_b = np.zeros(nf), cap_b.copy()
+    A = np.zeros(nf)
+    B = np.zeros(nf)
+    for _ in range(refine + 1):
+        t = np.linspace(0, 1, n)
+        ga = lo_a[:, None] + (hi_a - lo_a)[:, None] * t[None, :]
+        gb = lo_b[:, None] + (hi_b - lo_b)[:, None] * t[None, :]
+        pred = np.minimum(ga[:, :, None, None] * p[None, None, None, :]
+                          + gb[:, None, :, None] * q[None, None, None, :], 255.0)
+        d = pred - O[:, None, None, :]
+        c = np.einsum("finx,finx->fin", d, d)
+        ia, ib = np.unravel_index(c.reshape(nf, -1).argmin(axis=1), (n, n))
+        A = ga[np.arange(nf), ia]
+        B = gb[np.arange(nf), ib]
+        da = (hi_a - lo_a) / (n - 1) * 2
+        db = (hi_b - lo_b) / (n - 1) * 2
+        lo_a, hi_a = np.maximum(0, A - da), np.minimum(cap_a, A + da)
+        lo_b, hi_b = np.maximum(0, B - db), np.minimum(cap_b, B + db)
+    return A, B
+
+
+def _dp_g(O: np.ndarray, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """EXACT optimal monotone integer warp given (A, B).
+
+    The cost is separable across x; the only coupling is the monotone ordering,
+    so a prefix-min dynamic program over (x, g) is globally optimal — no search
+    heuristics needed for this block.
+    """
+    nx = O.shape[1]
+    p, q = _joint_features(np.arange(256))
+    P = np.minimum(np.outer(A, p) + np.outer(B, q), 255.0)
+    cost = ((P[:, None, :] - O[:, :, None]) ** 2).sum(axis=0)          # (NX, 256)
+    dp = np.empty((nx, 256))
+    arg = np.zeros((nx, 256), dtype=np.int32)
+    dp[0] = cost[0]
+    for k in range(1, nx):
+        run = np.minimum.accumulate(dp[k - 1])
+        # arg[k][j] = argmin of dp[k-1] over the prefix 0..j. Positions where
+        # dp equals the running min are the candidates; accumulate the LATEST
+        # such index (taking the earliest instead would pin arg to 0, since
+        # position 0 always ties its own prefix min, and collapse the warp).
+        arg[k] = np.maximum.accumulate(
+            np.where(dp[k - 1] <= run, np.arange(256), 0)).astype(np.int32)
+        dp[k] = cost[k] + run
+    g = np.zeros(nx, dtype=np.int64)
+    j = int(np.argmin(dp[nx - 1]))
+    g[nx - 1] = j
+    for k in range(nx - 1, 0, -1):
+        j = int(arg[k][j])
+        g[k - 1] = j
+    return g
+
+
+def fit_v_joint_safe(ref, channels: bool = False, limit: float = 255.5,
+                     caps=(256.0, 252.0, 248.0, 244.0, 240.0, 232.0)):
+    """fit_v_joint with the no-flat-field-clipping property ENFORCED.
+
+    The dark cap can be raised to the 10-bit ceiling safely, but the bright cap
+    genuinely can push the blended row over 255 at high levels. Rather than
+    assume a cap is safe, fit and then MEASURE the worst flat-field output,
+    lowering the bright cap until the behavioural gate passes. Returns
+    (lut, dark, bright, info).
+    """
+    for cap in caps:
+        lut, dark, bright = fit_v_joint(ref, cap_bright=cap, channels=channels)
+        worst = worst_flat_field_output(lut, dark, bright)
+        if worst <= limit:
+            return lut, dark, bright, {"cap_bright": cap, "worst_flat": worst}
+    return lut, dark, bright, {"cap_bright": caps[-1], "worst_flat": worst}
+
+
+def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
+                iters: int = 25, channels: bool = False,
+                seed: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Joint fit of the gamma warp AND the adaptive endpoint row sums.
+
+    Supersedes optimize_lut + fit_v_adaptive for shaders whose depth-vs-
+    brightness family the separate fits handle badly (Royale: 15.49 -> 6.55).
+    Three defects in the separate path, all fixed here:
+
+    1. WRONG OBJECTIVE. Both fitted in ROW-SUM space with uniform weight over x.
+       Output error is u*(row-sum error)/256, so uniform row-sum weighting is an
+       implicit 1/u^2 weighting in OUTPUT space, over-weighting dark levels up to
+       16x and dragging the bright endpoint down (shipped B(f=0.5)=144 where the
+       target wants ~252 — precisely the 105-code error at white).
+    2. u >= transfer. Costs ~2.4 codes alone and blocks all benefit from (3).
+    3. ROW SUM <= 256 — the big one (~6.1 codes). It is a far too strong proxy
+       for "no scaler clipping": the hardware clips on the BLENDED row sum times
+       the level, and the dark set's weight (256-lum)/256 goes to zero exactly
+       where the level is large, so a dark row sum of 511 never clips a flat
+       field. The real ceiling is the signed 10-bit coefficient limit — the dark
+       beam at f=0 is nearly a delta, so its peak tap IS the row sum.
+
+    Exact flat-field algebra (verified against the RTL model to RMSE 0.59):
+        v = LUT(x)/256;  out(f,x) = min(A_f*(v - v^2) + B_f*v^2, 255)
+    linear in (A, B), so both blocks solve exactly and BCD is a true descent.
+
+    Returns (lut, dark_table, bright_table).
+    """
+    if xs is None:
+        xs = np.arange(8, 256, 4) / 255.0
+    xs_i = np.round(xs * 255).astype(int)
+    fs = np.arange(0, 33) / 64.0
+    O = np.array([[255.0 * _ref_vertical(ref, f, x) for x in xs] for f in fs])
+
+    shapes = _endpoint_shapes(ref)
+    cap_a129 = np.minimum(511.0 / np.maximum(shapes[0].max(axis=1), 1e-9), 2044.0)
+    cap_a = np.interp(fs, np.arange(129) / 256.0, cap_a129)
+    cap_b = np.full(len(fs), cap_bright)
+
+    rng = np.random.default_rng(seed)
+    starts = [np.maximum.accumulate(xs_i.astype(np.int64)),
+              np.round(255 * (xs_i / 255.0) ** 0.5).astype(np.int64),
+              np.array([255 * _transfer(ref, x) for x in xs]).astype(np.int64),
+              np.full(len(xs), 255, dtype=np.int64)]
+    starts += [np.round(255 * np.sort(rng.random(len(xs)))).astype(np.int64)
+               for _ in range(6)]
+
+    best = (np.inf, None, None, None)
+    for g0 in starts:
+        g = np.maximum.accumulate(np.asarray(g0, dtype=np.int64).copy())
+        for _ in range(iters):
+            A, B = _solve_ab(O, g, cap_a, cap_b)
+            gn = _dp_g(O, A, B)
+            if (gn == g).all():
+                break
+            g = gn
+        A, B = _solve_ab(O, g, cap_a, cap_b, n=97, refine=7)
+        pred = np.minimum(np.outer(A, _joint_features(g)[0])
+                          + np.outer(B, _joint_features(g)[1]), 255.0)
+        r = float(np.sqrt(((pred - O) ** 2).mean()))
+        if r < best[0]:
+            best = (r, g.copy(), A.copy(), B.copy())
+    _, g, A, B = best
+
+    # Expand (A, B) onto 129 phases, apply the beam shape, mirror, quantize.
+    tables = []
+    p129 = np.arange(129)
+    for S33, shape in ((A, shapes[0]), (B, shapes[1])):
+        S129 = np.interp(p129 / 256.0, fs, S33)
+        fl = np.zeros((PHASES, 4))
+        fl[:129] = S129[:, None] * shape
+        for p in range(129, PHASES):
+            fl[p] = fl[PHASES - p][::-1]
+        fl = np.clip(fl, 0, None)
+        tgt = np.round(fl.sum(axis=1)).astype(np.int64)
+        for p in range(1, 128):
+            tgt[PHASES - p] = tgt[p]
+        tables.append(quantize.quantize_symmetric(fl, tgt))
+
+    gf = np.interp(np.arange(256), xs_i, g)
+    gf = np.maximum.accumulate(np.clip(np.round(gf), 0, 255))
+    gf[0] = 0
+    lut = np.zeros((256, 3), dtype=np.int64)
+    for c, name in enumerate("rgb"):
+        if channels:
+            ratio = np.array([_transfer(ref, x / 255.0, name)
+                              / max(_transfer(ref, x / 255.0), 1e-9)
+                              for x in range(256)])
+            lut[:, c] = np.clip(np.round(np.maximum.accumulate(gf * ratio)), 0, 255)
+        else:
+            lut[:, c] = gf
+    return lut, tables[0], tables[1]
+
+
+def worst_flat_field_output(lut: np.ndarray, dark: np.ndarray,
+                            bright: np.ndarray) -> float:
+    """Highest flat-field output any input level produces (gate: <= 255.5).
+
+    This is the behavioural form of "no scaler clipping". Checking each
+    endpoint's row sum against 256 is the wrong invariant: the hardware clips
+    on the BLENDED row, and the dark set's weight vanishes where the level is
+    high, so an over-unity dark row is harmless while a legal-looking pair can
+    still clip.
+    """
+    worst = 0.0
+    phases = np.arange(256)
+    for xi in range(256):
+        g = int(lut[xi, 1])
+        c128 = mm.adaptive_c128(dark, bright, phases,
+                                np.full(256, g, dtype=np.int64))
+        worst = max(worst, float((g * c128.sum(axis=1) / 32768.0).max()))
+    return worst
+
+
 def fit_v_fixed(ref, lut_ctrl: np.ndarray, xs: np.ndarray | None = None,
                 weights: np.ndarray | None = None) -> np.ndarray:
     """Single-set best-compromise V table against a GIVEN LUT.

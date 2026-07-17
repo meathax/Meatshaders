@@ -274,6 +274,30 @@ Deep scanlines at fractional scales: 224-line cores at 1080p show a faint
 line-thickness ripple (within the pack's moire guard); vscale_mode=1
 removes it entirely and is recommended for this preset.
 
+V5.2 REVISIONS (2026-07-17)
+---------------------------
+The filters are substantially more accurate: Guest Advanced is 2.9x closer to
+the shader, Royale 2.4x, Kurozumi 2.2x. Nothing about the intended look
+changed - this is the same target, hit harder.
+
+What changed: the pack's own rule "never let a filter exceed unity gain" was
+too blunt. It was written after v4 Easymode clipped its highlights, which was
+a real problem - but MiSTer does not clip on a filter's gain, it clips on the
+blended result times the picture level. Because the dark coefficient set's
+influence fades out exactly where the picture is bright, a dark filter can
+safely run hot. Forbidding that was costing real accuracy. The pack now tests
+the actual property - "can any flat field clip?" - by measuring it, instead of
+enforcing a proxy rule. Every shipped table still cannot clip.
+
+New: CRT Royale Kurozumi - Anti-Moire, for anyone running non-integer vertical
+scaling (vscale_mode=0) who sees faint line-thickness ripple on the standard
+Kurozumi preset. With vscale_mode=1 you do not need it.
+
+Remaining known gap: for Royale and Kurozumi the dominant error is now the
+shadow mask, not the filters - their masks are under-driven versus what the
+hardware could deliver. That is the next improvement and it is independent of
+everything above.
+
 V5.1 REVISIONS (2026-07-17)
 ---------------------------
 A second pass re-examined every shader in the pack against a corrected

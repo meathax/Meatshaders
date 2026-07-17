@@ -105,19 +105,32 @@ for key, (modname, fb, pb) in PORTS.items():
     if problems:
         hard_fail += problems
 
-    # --- 4. clipping ------------------------------------------------------------
-    worst = max(int(s.sum(axis=1).max()) for tag in ("VA", "VF", "VN")
-                for s in parsed[tag].sets)
-    print(f"clipping: max V row sum {worst} / 256 {'OK' if worst <= 256 else 'FAIL'}")
-    if worst > 256:
-        hard_fail.append(f"{fb}: over-unity V row {worst}")
+    # --- 4. clipping (behavioural) ------------------------------------------------
+    # "max V row sum <= 256" is the WRONG invariant: the hardware clips on the
+    # BLENDED row times the level, and the dark set's weight vanishes exactly
+    # where the level is high, so an over-unity dark row is harmless while a
+    # legal-looking pair can still clip. Test the property itself instead, and
+    # gate the coefficient range separately (which the old rule covered by luck).
+    va = parsed["VA"]
+    worst_flat = fitting.worst_flat_field_output(lut, va.dark, va.bright)
+    coef = max(int(np.abs(s).max()) for tag in ("VA", "VF", "VN")
+               for s in parsed[tag].sets)
+    rows = max(int(s.sum(axis=1).max()) for tag in ("VA", "VF", "VN")
+               for s in parsed[tag].sets)
+    ok_clip, ok_fmt = worst_flat <= 255.5, coef <= 511
+    print(f"clipping: worst flat-field output {worst_flat:.1f}/255 "
+          f"{'OK' if ok_clip else 'FAIL'}   (max row sum {rows}, "
+          f"max |coeff| {coef}/511 {'OK' if ok_fmt else 'FAIL'})")
+    if not ok_clip:
+        hard_fail.append(f"{fb}: flat field clips ({worst_flat:.1f})")
+    if not ok_fmt:
+        hard_fail.append(f"{fb}: coefficient {coef} outside signed 10-bit")
 
     # --- 2. RMSE ------------------------------------------------------------------
     # The masked metric is the acceptance number: it compares port pixels
     # against shader pixels THROUGH the mask, so it sees clamp-order error and
     # is meaningful for gain-split builds (where mask-off is G times dark by
     # construction). Mask-off is reported alongside for continuity only.
-    va = parsed["VA"]
     m_target = fitting.mask_encoded_tile(ref)
     rmse, emax = fitting.rmse_exact_masked(ref, va.dark, va.bright,
                                            parsed["H"].sets[0], lut, mask.tokens,

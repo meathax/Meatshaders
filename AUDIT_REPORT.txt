@@ -354,3 +354,67 @@ Two horizontal error sources remain invisible to every flat-field metric in
 this pack: the anti-ringing clamp (Easymode, ~6 codes RMS on midtone content)
 and linear-vs-encoded filtering order (up to ~81 codes on a hard black/white
 edge). Both are horizontal-only and unfixable within a single pre-scaler LUT.
+
+
+====================================================================
+ V5.2 AUDIT (2026-07-17) - THE ROW-SUM RULE WAS WRONG
+====================================================================
+
+The v5 design rule "keep every V row sum <= 256" was inherited from the v4
+Easymode post-mortem, where over-unity rows really were clipping highlights.
+Generalised into a hard constraint it became the single largest source of
+error in the pack - worth ~6 codes on Royale alone.
+
+It is a FAR TOO STRONG PROXY for its own intent. The hardware does not clip
+on either endpoint's row sum; it clips on the BLENDED row times the input
+level. The dark set's blend weight is (256-lum)/256, which goes to zero
+exactly where the level is large - so a dark row sum of 511 cannot clip a
+flat field, while a pair that both look legal at 256 still can. The real
+ceiling on the dark set is the signed 10-bit coefficient format (the dark
+beam at phase 0 is nearly a delta, so its peak tap IS its row sum).
+
+Two further defects in the same code path:
+  - optimize_lut/fit_v_adaptive minimised error in ROW-SUM space with uniform
+    weight over x. Output error is u*(row-sum error)/256, so that is an
+    implicit 1/u^2 weighting in OUTPUT space - dark levels over-weighted up to
+    16x, dragging the bright endpoint down (Royale's bright trough row sat at
+    144 where the target wanted ~252: precisely its 105-code error at white).
+  - The u >= transfer constraint cost ~2.4 codes on its own AND blocked any
+    benefit from lifting the row cap.
+
+fit_v_joint replaces both with a joint fit of the shared gamma warp and the
+per-phase endpoint row sums, using the exact flat-field algebra
+    v = LUT(x)/256;  out(f,x) = min(A_f*(v - v^2) + B_f*v^2, 255)
+which is linear in (A,B), so each block solves exactly (the warp block is a
+dynamic program - globally optimal, not a search). Clip-safety is now MEASURED
+per candidate and the bright cap lowered until it holds, rather than assumed.
+
+RESULTS (exact model, mask off / through the mask)
+--------------------------------------------------
+                    v5.1 -> v5.2 (mask off)    through the mask
+  Guest Advanced      2.68  ->  0.94  (-65%)     2.55 -> 1.16
+  Royale             15.49  ->  6.52  (-58%)    18.23 -> 16.56
+  Royale Kurozumi    10.77  ->  4.98  (-54%)    25.98 -> 24.62
+  Easymode v5         3.16 (gain-split path, unchanged)
+
+Gate 4 is now behavioural: "no flat field may clip" is tested directly by
+sweeping every input level through the blended row, with a separate format
+gate on the coefficient range (which the old rule had been covering by
+accident). Every shipped table passes: worst flat-field outputs are
+251.9 / 255.5 / 252.0 / 255.0 of 255, max |coeff| <= 511.
+
+HONEST NOTES
+------------
+- The masked figures improve far less than the mask-off ones because Royale's
+  and Kurozumi's remaining error is now MASK-dominated, not filter-dominated.
+  The Royale tile peaks at 1.625 encoded where a joint mask fit wants the
+  1.9375 ceiling; refitting the mask alone is worth far more than any further
+  filter work. That is the next job, and it is independent of the V/LUT fit.
+- Guest's non-adaptive degradation got WORSE (20.0 -> 27.0 codes): the joint
+  fit makes its two endpoint sets more different, which is the whole point on
+  an adaptive core and a liability on a v6 one. Its Fixed Compatibility preset
+  measures 4.55 codes and is the correct choice there.
+- Kurozumi's exact fit now misses the moire guard (7.74 vs 7.65). The builder
+  detected this and emitted CRT Royale Kurozumi - Anti-Moire automatically
+  (widened beam, 2.29). Note the guard only matters at FRACTIONAL vertical
+  scales; with vscale_mode=1 (integer scaling) it is moot.
