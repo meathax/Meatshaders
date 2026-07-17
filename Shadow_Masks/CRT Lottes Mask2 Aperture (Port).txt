@@ -1,9 +1,0 @@
-####
-# Name: CRT Lottes Mask 2 - Aperture Grille
-# Original shader: Timothy Lottes; MiSTer fixed-pipeline port
-# Type: CRT
-# Nearest 1/16-step power-2.2 compensation for maskLight/maskDark
-####
-v2
-3,1
-43c,23c,13c

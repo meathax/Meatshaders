@@ -1,13 +1,9 @@
-# 256 Phase Filters
-# Single Set of Coefficients
-#
-# Canonical crt-easymode four-tap Lanczos-family horizontal kernel
-# SHARPNESS_H=0.5; source passes SHARPNESS_H squared (=0.25)
-# Exact phase-pair symmetry; source min/max clamp remains nonlinear
+# Name: CRT Easymode (Port)_H
+# Original shader: crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
 
 10bit
 
-# Coefficients
    0, 256,   0,   0
    0, 256,   0,   0
   -1, 256,   1,   0

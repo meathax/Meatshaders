@@ -1,9 +1,11 @@
 ####
 # Name: CRT Easymode (Port)
-# Original shader: Easymode; MiSTer fixed-pipeline port
-# Type: CRT
-# MASK_STRENGTH=0.3; nearest 1/16-step output-gamma compensation
+# crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Fitted in encoded space with MiSTer's exact saturating mask arithmetic
+# Carries the 1.105 gain-split factor; pair only with the matching (Port) gamma
+# Pixel-local objective over the complete hardware/reference LCM supercell
+# Tile kind: mean
 ####
 v2
 3,1
-40d,20d,10d
+42f,22f,12f

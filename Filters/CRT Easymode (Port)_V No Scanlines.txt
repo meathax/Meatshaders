@@ -1,12 +1,10 @@
-# 256 Phase Filters
-# Single Set of Coefficients
-#
-# Canonical InputSize.y >= 400 path: vertical interpolation with no scan attenuation
-# Use for 400/480-line, interlaced, and other high-resolution sources
+# Name: CRT Easymode (Port)_V No Scanlines
+# Original shader: crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
+# Scan-free vertical interpolation; interlace fallback
 
 10bit
 
-# Coefficients
    0, 256,   0,   0
    0, 256,   0,   0
    0, 256,   0,   0

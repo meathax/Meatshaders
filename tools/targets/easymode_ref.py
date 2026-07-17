@@ -495,8 +495,9 @@ def notes():
         "image brightens) but the tap ratios never change. The dark endpoint "
         "and bright endpoint tables differ only by row SUM at the trough.",
 
-        "*** CLIP-vs-TROUGH CONFLICT (irreducible; this is THE Easymode v5 "
-        "design decision) ***: BRIGHT_BOOST clips the PEAK at x >= 0.8487, but "
+        "*** CLIP-vs-TROUGH CONFLICT (irreducible; this is THE canonical "
+        "Easymode design decision) ***: BRIGHT_BOOST clips the PEAK at "
+        "x >= 0.8487, but "
         "the TROUGH is 0.65*x^2 encoded = 0.952 at white, which never clips. "
         "So across x in [216,255] the reference peak is pinned at 255 while "
         "the reference trough still rises 200 -> 241 codes. On MiSTer the "

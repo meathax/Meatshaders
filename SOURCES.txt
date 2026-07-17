@@ -126,8 +126,8 @@ Reproducible executable references are vendored in tools/targets/:
 They replace the original session scratchpad dependency. The build uses these
 files by default; MISTER_SHADER_REFERENCES is only an explicit override.
 
-MiSTer implementation references re-verified for v6 at the same pinned
-commits as v4 (Main 7317947f, Template 6d29ac7c): ascal.vhd polyphase and
+MiSTer implementation references re-verified for the canonical pack at the
+pinned commits (Main 7317947f, Template 6d29ac7c): ascal.vhd polyphase and
 adaptive-lerp arithmetic, shadowmask.sv v2 token decode and shift/add
 truncation, video.cpp preset/filter/gamma/mask parsing, video_mixer.sv
 gamma placement, sys_top.v pipeline order.
@@ -145,17 +145,16 @@ Current toolchain (kept in tools/ so the pack can be regenerated):
   validate_port.py  acceptance gates (formats, RMSE, brightness,
                     clipping, moire)
   validate_patterns.py nonuniform selector/RGB/impulse/step/checker diagnostics
-  preset_contracts.py complete 40-preset semantic and axis contracts
+  preset_contracts.py exact 10-preset semantic, manifest and axis contracts
   selftest_mister_model.py exact phase/FIR/adaptive/mask arithmetic regressions
   selftest_mask_period.py full-LCM FFT vs brute force, including mask mode 2x
   selftest_presets.py exact preset inventory and cross-preset pairings
-  selftest_easymode_antiring.py source-clamp and compatibility-alias proof
   DESIGN.md         the mapping specification
 
-Current acceptance evaluates the complete periodic LCM supercell, reports both
-best rigid roll and strict origin, refines Kurozumi channel-aware through its
-colored black lift, and gates gamma unique-level/plateau/step diagnostics plus
-both RMS and maximum individual-pixel error.
+Current acceptance evaluates complete 1080-line frames at 224p and 240p,
+scores the full periodic LCM supercell at strict origin, refines Kurozumi
+channel-aware through its colored black lift, and gates gamma quality,
+clipping, moire, RMS and maximum individual-pixel error.
 
 Guest Advanced and Royale sources are GPL; the derived coefficient tables
 retain that licensing status. Kurozumi is a parameter set over Royale.

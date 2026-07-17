@@ -1,10 +1,10 @@
-"""Self-test for quantize.py: invariants + reconstruction of a v4 table.
+"""Self-test for quantize.py: invariants + reconstruction of a shipped table.
 
 Test 1: quantizing smooth synthetic kernels yields tables that pass the
         fileio validator (symmetry, range) with exact requested sums.
-Test 2: rows quantized from the v4 Lottes fixed V filter's own float form
-        (coeffs/256 with tiny noise) reproduce the stored integers, i.e. the
-        quantizer agrees with how the shipped pack was built.
+Test 2: rows quantized from the canonical Lottes fixed V table's own
+        float form (coeffs/256 with tiny noise) reproduce the stored integers,
+        i.e. the quantizer agrees with how the shipped pack was built.
 """
 
 import os
@@ -48,17 +48,18 @@ if bad:
 if abs(table[128].sum() - sums[128]) > 1:
     fail.append(f"phase128 sum off by {table[128].sum() - sums[128]}")
 
-# --- Test 2: agreement with a shipped v4 table
-src = fileio.parse_filter(os.path.join(ROOT, "Filters", "CRT Lottes (Port)_V.txt"))
-stored = src.sets[0].astype(np.float64)
+# --- Test 2: agreement with a retained canonical table
+src = fileio.parse_filter(
+    os.path.join(ROOT, "Filters", "CRT Lottes (Port)_V.txt"))
+stored = src.dark.astype(np.float64)
 noisy = stored + rng.uniform(-0.25, 0.25, stored.shape)  # sub-half-unit jitter
 sums2 = stored.sum(axis=1).astype(np.int64)
 rebuilt = quantize.quantize_symmetric(noisy, sums2)
 diff = np.abs(rebuilt - stored)
 if diff.max() > 1:
-    fail.append(f"v4 reconstruction differs by up to {diff.max()}")
+    fail.append(f"canonical reconstruction differs by up to {diff.max()}")
 n_off = int((diff > 0).sum())
-print(f"v4 Lottes V reconstruction: {n_off}/{stored.size} coefficients moved by 1 "
+print(f"canonical Lottes V reconstruction: {n_off}/{stored.size} coefficients moved by 1 "
       f"(max {int(diff.max())}) under +-0.25 jitter")
 
 if fail:

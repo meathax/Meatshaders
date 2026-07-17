@@ -14,11 +14,12 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fileio  # noqa: E402
+import preset_contracts  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
 counts = {"filter": 0, "gamma": 0, "mask": 0, "preset": 0}
-EXPECTED_COUNTS = {"filter": 44, "gamma": 10, "mask": 21, "preset": 40}
+EXPECTED_COUNTS = {"filter": 14, "gamma": 4, "mask": 5, "preset": 10}
 
 with tempfile.TemporaryDirectory() as tmp:
     for path in sorted(glob.glob(os.path.join(ROOT, "Filters", "*.txt"))):
@@ -124,6 +125,16 @@ with tempfile.TemporaryDirectory() as tmp:
 
 if counts != EXPECTED_COUNTS:
     failures.append(f"inventory mismatch: expected {EXPECTED_COUNTS}, got {counts}")
+for folder, expected_names in preset_contracts.PACK_MANIFEST.items():
+    folder_path = os.path.join(ROOT, folder)
+    actual_names = {
+        entry.name for entry in os.scandir(folder_path) if entry.is_file()
+    }
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        failures.append(
+            f"{folder}/ manifest mismatch: missing={missing}, extra={extra}")
 
 print(f"parsed: {counts}")
 if failures:

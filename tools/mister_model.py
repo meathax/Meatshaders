@@ -146,33 +146,75 @@ def apply_mask(img: np.ndarray, mult16: np.ndarray) -> np.ndarray:
 def flat_field_profile(x_code: int, vscale: float, dark: np.ndarray,
                        bright: np.ndarray | None = None,
                        lut: np.ndarray | None = None,
-                       n_out: int = 256) -> np.ndarray:
+                       n_out: int = 256, channel: int = 0) -> np.ndarray:
     """Vertical intensity profile (pre-mask) of a uniform field of code x_code.
 
-    Returns (n_out,) 8-bit codes. For a flat field the H stage is identity up
-    to its own DC gain; callers whose H filter is not unity-DC should fold the
-    H gain into x_code first.
+    Returns (n_out,) 8-bit codes for ``channel``.  Adaptive control is the
+    maximum RGB LUT output, independently of the signal channel, matching the
+    scaler RTL.  For a flat field the H stage is identity up to its own DC
+    gain; callers whose H filter is not unity-DC should fold the H gain into
+    x_code first.
     """
-    g = lut[:, 0][x_code] if lut is not None else x_code
-    lines = np.full(64, g, dtype=np.int64)
+    if channel not in (0, 1, 2):
+        raise ValueError(f"channel must be 0, 1, or 2, got {channel}")
+    if lut is None:
+        signal = ctrl_level = x_code
+    else:
+        signal = int(lut[x_code, channel])
+        ctrl_level = int(lut[x_code].max())
+    lines = np.full(64, signal, dtype=np.int64)
     pos = (np.arange(n_out) + 0.5) / vscale - 0.5 + 8.0   # away from edges
     if bright is None:
         return fir_1d(lines, dark, pos)
-    ctrl = np.full(n_out, g, dtype=np.int64)              # flat field: ctrl = level
+    ctrl = np.full(n_out, ctrl_level, dtype=np.int64)
     return fir_1d_adaptive(lines, dark, bright, pos, ctrl)
 
 
 def moire_metrics(profile: np.ndarray, vscale: float) -> dict:
-    """Per-scanline-period peak/trough statistics of a vertical profile."""
-    period = vscale
-    n_per = int(len(profile) / period) - 2
-    peaks, troughs = [], []
-    for k in range(1, n_per):
-        seg = profile[int(k * period):int((k + 1) * period) + 1]
-        if len(seg):
-            peaks.append(seg.max())
-            troughs.append(seg.min())
-    peaks, troughs = np.array(peaks, dtype=np.float64), np.array(troughs, dtype=np.float64)
+    """Exact sampled beam-centre/trough statistics for one output frame.
+
+    Output pixel ``j`` samples source position ``(j+.5)/scale-.5``.  The old
+    implementation split the profile into overlapping integer slices and
+    included both endpoints in every slice.  At fractional scale that lets two
+    neighbouring scanlines reuse whichever shared trough is darker, hiding the
+    real alternating line thickness (most visibly at 240p -> 1080p = 4.5x).
+
+    For every complete source-line cell in the supplied frame, sample the two
+    output pixels bracketing its exact beam centre and retain the brighter one;
+    do the analogous operation at every inter-line midpoint and retain the
+    darker one.  These are the discrete extrema actually present on screen.
+    """
+    profile = np.asarray(profile)
+    if profile.ndim != 1:
+        raise ValueError(f"profile must be one-dimensional, got {profile.shape}")
+    if len(profile) < 2:
+        raise ValueError("profile must contain at least two output samples")
+    if not np.isfinite(vscale) or vscale <= 0:
+        raise ValueError(f"vscale must be finite and positive, got {vscale}")
+
+    # Source coordinates covered by the first/last output-pixel centres.
+    pos_first = 0.5 / vscale - 0.5
+    pos_last = (len(profile) - 0.5) / vscale - 0.5
+    # Retain only source-line cells whose two half-line boundaries lie inside
+    # the sampled frame; this removes incomplete edge cells deterministically.
+    first_center = int(np.ceil(pos_first + 0.5))
+    last_center = int(np.floor(pos_last - 0.5))
+    centers = np.arange(first_center, last_center + 1, dtype=np.float64)
+    if len(centers) < 2:
+        raise ValueError("profile does not cover two complete source-line cells")
+
+    def bracketing_indices(source_positions: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        # Invert source_pos=(j+.5)/scale-.5, then inspect both neighbouring
+        # integer output pixels.  floor==ceil at an exactly sampled extremum.
+        jf = (source_positions + 0.5) * vscale - 0.5
+        lo = np.clip(np.floor(jf).astype(np.int64), 0, len(profile) - 1)
+        hi = np.clip(np.ceil(jf).astype(np.int64), 0, len(profile) - 1)
+        return lo, hi
+
+    plo, phi = bracketing_indices(centers)
+    tlo, thi = bracketing_indices(centers[:-1] + 0.5)
+    peaks = np.maximum(profile[plo], profile[phi]).astype(np.float64)
+    troughs = np.minimum(profile[tlo], profile[thi]).astype(np.float64)
     return {
         "mean": float(profile.mean()),
         "peak_mean": float(peaks.mean()),

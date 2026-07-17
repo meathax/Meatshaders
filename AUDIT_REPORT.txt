@@ -1,538 +1,180 @@
 ====================================================================
- EXACT-HARDWARE AUDIT - COMPLETE MiSTer CRT PORT PACK
+ MiSTer CRT CANONICAL 1080p PACK - PIXEL-ACCURACY AUDIT
+ 2026-07-17
 ====================================================================
 
-Audit completed: 2026-07-17
-Edition: v6 pixel-accuracy / hardware-limit audit
-Reference MiSTer Main: 7317947f41f6d085444ff00d297896aba2041ca0
-Reference MiSTer Template: 6d29ac7ca3c721792a72e30393357c57fb7f8f1b
-References: glsl-shaders 2b2c5ee3; slang-shaders 3b0d6aa1
-
-
-CURRENT ACCEPTANCE RESULTS
---------------------------
-Exact endpoint-inclusive end-to-end RMS through the mask over the complete periodic LCM
-supercell (output codes):
-
-                            Default   Fixed   No Gamma
-  CRT Guest Advanced          1.230   4.785      2.029
-  CRT Royale                 16.720  23.497     17.370
-  CRT Royale Kurozumi        19.854  25.311     19.517
-  CRT Easymode v5             3.591   9.286      6.207
-  CRT Lottes                  1.260   1.166   off by design
-
-Maximum errors in the same family order are:
-  Default     7.4 /  77.0 / 112.3 / 18.1 / 4.5
-  Fixed      25.9 / 102.4 / 149.3 / 30.0 / 4.5
-  No Gamma   10.4 /  77.0 /  79.7 / 21.7 / off by design
-They are hard-gated alongside RMS. Kurozumi code 0 has its own channel-aware
-gate: 1.005 RMS, 3.7 maximum, preserving LUT[0] = (5,2,2) and the warm colored
-black lift.
-
-Optional Edge Stable results (RMS / selector-only jump / moire):
-  Guest Advanced        1.763 /  0 / 1.78
-  Royale               28.029 / 16 / 5.31
-  Easymode v5           8.818 / 12 / 2.96
-
-Kurozumi Default is pixel-local. Perceptual Dither measures 2.99 codes only
-after integrating partner pixels; its honest raw-pixel pipeline result is
-30.901 RMS with a 118.3-code maximum. Default moire results are 1.71 / 5.31 /
-6.82 / 2.24 / 1.38 for Guest, Royale, Kurozumi, Easymode v5 and Lottes: every
-Default passes the 7.65 guard. Anti-Moire remains an optional Kurozumi profile
-with a wider 2.07-code stability margin.
-
-The current hardware model fixes two subtle RTL errors in earlier audits:
-runtime scaler phase is the upper eight fractional bits (`frac12 >> 4`) with
-no rounding/carry, and adaptive coefficients use one signed `>> 1` after the
-weighted sum, so odd 3.15 values are valid. Mask scores use
-lcm(hardware period, reference period), not one upper-left hardware crop.
-
-Current inventory: 44 filters, 10 gamma LUTs, 21 masks and 40 presets. Five
-reference modules are vendored in tools/targets/. All arithmetic, quantizer,
-format, preset, anti-ring, full-period/2x-mask and end-to-end gates pass.
-
-
-====================================================================
- HISTORICAL V4 AUDIT (SUPERSEDED METRICS; RETAINED AS RELEASE HISTORY)
-====================================================================
-
-The sections below preserve the reasoning and measurements from prior releases.
-Where they conflict with CURRENT ACCEPTANCE RESULTS, the current full-period
-and channel-aware numbers above are authoritative.
-
-
-BOTTOM LINE
+AUDIT SCOPE
 -----------
-Portable MiSTer filter/gamma/mask files cannot be absolutely identical to the
-source GLSL. MiSTer has no programmable fragment stage: its portable path is a
-pre-scaler gamma LUT, optional core scanline logic, one horizontal and one
-vertical four-tap FIR, then a quantised HDMI shadow mask. The shaders require
-nonlinear and neighbourhood-dependent operations after filtering.
-
-This edition implements every high-value representable improvement found in a
-second independent math and RTL audit. It is materially closer than v3 while
-retaining conservative and non-adaptive fallbacks.
-
-
-V4 IMPROVEMENTS
----------------
-1. Easymode gain now clips later
-
-   The recommended Matched LUT is now only:
-
-     round(255 * input^(2/1.8))
-
-   Its remaining scalar compensation is applied in the last scaler axis rather
-   than before H filtering. Non-clipped uniform math is preserved, while bright
-   Lanczos edges survive the H-stage 8-bit clamp. TATE uses separately boosted H
-   tables in the hardware V slot so gain still occurs at the last scaler stage.
-
-
-2. Easymode adaptive rows are fitted directly, phase by phase
-
-   The old adaptive table interpolated two nominal scan_bright states. The new
-   table fits both endpoint sums independently for every phase over RGB colours,
-   using the actual unboosted gamma control, MiSTer's max-RGB adaptation, stage
-   clamps and shift/add 42f mask. It better approximates the shader's
-   (max+luma)/2 brightness response without claiming those endpoint rows are
-   literal shader parameter states.
-
-   Deterministic hardware-model RGB-lattice RMSE: 4.010 output codes.
-
-
-3. Correct >=400-line Easymode path added
-
-   The shader disables scan attenuation at InputSize.y >= 400 but still applies
-   SHARPNESS_V=1 half-circle vertical interpolation. Previous advice to use the
-   H filter vertically substituted a Lanczos kernel and was wrong. New base and
-   Matched No Scanlines tables plus landscape/TATE presets implement the correct
-   path. Landscape presets also use it explicitly for interlaced fallback.
-
-
-4. Hardware-fitted Highlights rebuilt
-
-   Highlights is regenerated against saturated-white source targets and
-   shadowmask.sv's real shift/add/truncate arithmetic. It is now paired with the
-   late-boost Matched gamma/mask layout instead of the old preboost factorisation.
-
-   Weighted saturated-white RMSE is 6.597 codes. The remaining error is the
-   hard 93.75% ceiling for inactive channels in MiSTer's v2 mask encoding.
-
-
-5. Exact stored-phase symmetry enforced
-
-   For phases 1..127, phase 256-i is the exact tap reversal of phase i. Phase
-   128 is self-symmetric. This removes one-coefficient directional bias at the
-   frequently used half phase. A midpoint row may differ from ideal DC by at
-   most one coefficient unit when exact symmetry and an odd target sum conflict.
-
-
-6. Easymode pixel-art anti-ringing approximation retired after exact audit
-
-   The old optional table fitted the source's nonlinear local min/max clamp
-   over 16 binary neighbourhoods, but its objective omitted MiSTer's mandatory
-   H-stage 0..255 saturation. On binary data that hardware clamp already has
-   the same bounds as the source clamp: equal inner taps imply 0 or 255, while
-   different inner taps span the complete code range.
-
-   Exact pairwise-truncation results over phases 0..128:
-
-     canonical H        binary RMSE 0.5343, five-level RMSE 2.8624
-     former anti-ring   binary RMSE 4.5878, five-level RMSE 5.0993
-
-   Nonnegative two/four-tap fits and clipped-negative kernels were worse.
-   Model-loop aggregate compromises exist, but every nontrivial candidate
-   regressed at least one binary or five-level neighbourhood in the pointwise
-   search. The Pixel-Art preset names are therefore retained as compatibility
-   aliases of canonical normal/matched-boost H tables.
-
-
-7. Lottes' enabled-by-default bloom is now represented
-
-   Canonical crt-lottes compiles with DO_BLOOM. The old port was a sound crisp
-   no-bloom approximation but not the source default. The new source-default H
-   blends 16.3618283% of H7(-1.5) into H5(-3). V is least-squares fitted to
-   Tri + 0.15*Bloom and constrained to preserve the source flat-field gain.
-
-   Results:
-
-     Four-tap bloom support retained:             at least 98.835%
-     Omitted halo contribution to total:          at most 0.175%
-     Constrained 4x4 spatial relative error:      about 1.8%
-
-   The prior pair is retained as CRT Lottes Crisp (Port)_H/V.
-
-
-8. Lottes mask and V gain are now jointly matched
-
-   New 47e/27e/17e masks use selected/other multipliers of 23/16 and 14/16.
-   Their ratio closely matches the encoded equivalent of Lottes' linear-light
-   1.5/0.5 mask. The coupled V tables reduce gain so the complete pair, not the
-   mask alone, matches the source. Hardware shift truncation is modelled.
-
-   Exact generated-table evaluation on the deterministic RGB fitting lattice,
-   using MiSTer's adaptive interpolation, FIR truncation, 8-bit clamps and mask
-   shifts, gives these flat-field results against the full bloom-enabled source:
-
-     Matched adaptive RMSE:                        1.818 codes
-     Matched fixed RMSE:                           1.833 codes
-     Retained crisp/no-bloom profile RMSE:        12.908 codes
-     Matched adaptive maximum channel error:       6.782 codes
-
-   These figures isolate uniform colour/scan/mask transfer; the separate 1.8%
-   spatial-kernel result measures non-uniform structure. The adaptive version is
-   the closest, while fixed is within about 1% and works on non-adaptive cores.
-
-
-9. TATE/interlace presets corrected
-
-   Main falls back to the H slot for interlaced video when ifilter is disabled.
-   In a TATE preset that slot contains the rotated scan profile, so ifilter=same
-   was incorrect. Every TATE preset now names an explicit last-axis filter.
-
-
-10. Double-scanline setup hazard documented
-
-   A core's Scandoubler Fx / Scanlines logic runs before ascal. It must be Off
-   when using these profiles; otherwise scanlines are applied twice and the
-   adaptive control signal is altered before the fitted table sees it.
-
-
-WHAT STILL CANNOT BE MADE IDENTICAL
------------------------------------
-Easymode:
-
-  - local min/max anti-ringing clamp;
-  - exact nonlinear transfer and boost after both filter axes;
-  - exact (max RGB + Rec.709 luma)/2 brightness control;
-  - mask before output gamma;
-  - automatic source-height cutoff.
-
-Lottes:
-
-  - exact linear-light edge mixing and piecewise-sRGB output;
-  - nonseparable 7x5 Tri/Bloom with H3/H5/H7 selected by line;
-  - curvature, border/off-screen treatment;
-  - linear-light shadow mask before sRGB.
-
-MiSTer-wide constraints:
-
-  - four taps per separable axis;
-  - one shared adaptive table/control path, so H and V cannot both adapt;
-  - 8-bit intermediate clamping and 10-bit coefficients;
-  - 1/16-step mask multipliers implemented by truncated shifts;
-  - no post-scaler gamma LUT and no shader-program file format.
-
-
-VALIDATION SCOPE
-----------------
-The completed package is checked for:
-
-  - 256 phases per set and exactly two equal sets for adaptive files;
-  - signed 10-bit coefficient range;
-  - conjugate phase pairs and self-symmetric phase 128;
-  - Main-compatible 64/16-phase downsampling;
-  - 256 monotonic gamma entries;
-  - v2 mask dimensions, rows and tokens;
-  - exact case-sensitive preset references and all seven supported fields;
-  - explicit interlace fallbacks for landscape and TATE;
-  - ZIP integrity and byte-identical extraction.
-
-Historical v4 inventory: 20 filter files, 2 gamma LUTs, 8 shadow masks and
-19 presets. See the current inventory at the top of this report.
-
-This is mathematical/RTL validation. Final preference still depends on panel
-EOTF, viewing distance and phosphor-pitch taste; no physical MiSTer/display A/B
-test was available in this environment.
-
-See README.txt for installation and profile selection, and SOURCES.txt for
-source hashes, licensing and implementation references.
-
-
-====================================================================
- HISTORICAL V5.0 AUDIT (SUPERSEDED) - GUEST / ROYALE / KUROZUMI
-====================================================================
-
-The row-sum constraint, mask-off objective and quoted results in this section
-are historical. They are not current acceptance results.
-
-METHOD
-------
-Each shader's default-parameter math was extracted from pinned sources into
-a validated Python reference implementation (13-26 hand-computed checks per
-shader against the quoted GLSL/slang code). MiSTer's arithmetic was
-re-verified at RTL level and modeled exactly (tools/mister_model.py):
-truncating pair-sum FIR with per-axis 8-bit clamps, adaptive lerp with its
-1-bit truncation and 255/256 bright-set ceiling, per-set-bit truncated
-shift/add mask multipliers. Tables were fitted per phase by least squares
-against the references (tools/fitting.py), with the gamma LUT co-optimized
-against the adaptive endpoint fit under the constraint LUT >= beam-center
-transfer, which guarantees every V row <= unity (no scaler clipping,
-anywhere, by construction). Full pipeline (tools/) is kept in the pack.
-
-RESULTS (exact-model simulation vs reference, mask off, f x gray-ramp grid)
---------------------------------------------------------------------------
-  CRT Guest Advanced   RMSE  3.21 codes (max 24.1)   moire worst-std 1.94
-  CRT Royale           RMSE 15.92 codes (max 109.4)  moire worst-std 7.14
-  CRT Royale Kurozumi  RMSE 12.03 codes (max 62.4)   moire worst-std 5.74
-  (v4 benchmarks: Lottes 1.8, Easymode 4.0; moire guard <= 7.65 codes;
-   fixed-fallback tables are coarser by design: 7.3 / 38.4 / 26.2)
-
-Flat-field brightness parity at x = 0.25 / 0.5 / 0.75 (masked): within
-+-4.4 codes for all three shaders. At x = 1.0: Guest -16, Royale -61,
-Kurozumi -33 codes — see irreducible limits below.
-
-CLIPPING: max V row sum is exactly 256 in every table (audited).
-
-IRREDUCIBLE LIMITS (concentrations of the RMSE)
------------------------------------------------
-1. Royale's white bloom-fill: scanline depth vs brightness is non-monotone
-   (deep through mids, near-flat at white). A two-endpoint linear blend in
-   the post-LUT code cannot represent that reversal; a weighting study
-   (uniform / bright-weighted / extremes / mid-weighted) shifted but never
-   removed the error, and pinning the bright endpoint to white-flat
-   destroys mid-tone scanlines entirely. The shipped fit keeps mids
-   faithful and leaves mild scanlines on near-white flat fields.
-2. Kurozumi's LUT saturation: its transfer reaches 1.0 near x = 0.74
-   (faithful - the shader clips there too), so above that level the
-   adaptive control cannot distinguish inputs and trough differences in
-   the top quarter collapse to one profile.
-3. Kurozumi's mask: the rendered 2-px grille needs per-pixel triples
-   (1.34, 1.01, 0.55) encoded; v2 tokens give the two non-selected
-   channels one shared value. Luma-weighted fit preserves the R ripple
-   and average luma; the B ripple flattens (token rmse 0.104).
-4. Royale's mask: the 24x24 rendered slot tile exceeds the 16x16 hardware
-   mask; best divisor-periodic fit is 12x3 (period rmse 0.117). Non-divisor
-   periods were rejected: they score better inside one tile but beat
-   against the pattern when repeated across the screen.
-
-Also unrepresentable (documented in tools/DESIGN.md and the reference
-notes): royale/kurozumi misconvergence and halation/diffusion spatial
-spread, guest's chroma-dependent beam narrowing, anti-ring clamps,
-linear-light vs encoded filtering order, curvature.
-
-As with v4: mathematical/RTL validation only; no physical A/B on this
-machine. The 1080p moire guard passes for all shipped adaptive tables at
-4.5x and 4.821x; vscale_mode=1 is recommended for Kurozumi regardless.
-
-
-====================================================================
- HISTORICAL V5.1 AUDIT (SUPERSEDED) - SECOND PASS
-====================================================================
-
-This release introduced honest mask-on scoring but still evaluated only one
-hardware-sized crop and made pair-averaged Kurozumi dither the default. Both
-choices are superseded by the current full-period pixel-local audit.
-
-THE METRIC WAS WRONG, AND IT MATTERED
--------------------------------------
-V5.0 scored ports with the mask disabled. That measurement assumes the port's
-mask equals the shader's, so it is blind to clamp-ORDER error (the shader
-clips clamp(beam*mask) AFTER the mask; MiSTer clamps the V stage and then
-saturates inside the mask) and it is actively inverted for any factorization
-that puts gain in the mask. All v5.1 numbers below use rmse_exact_masked:
-port pixels vs shader pixels through the mask, roll-invariant.
-
-Some v5.1 numbers are therefore WORSE than the v5.0 figures for the same
-files. That is the metric telling the truth for the first time, not a
-regression - and one such reveal (Royale's mask) was a real defect.
-
-RESULTS (masked metric, output codes)
--------------------------------------
-                        v5.1     v5.0-era     non-adaptive core
-  Guest Advanced        2.55       2.68            19.97
-  Easymode v5           3.16       4.97 (v4)       20.67
-  Royale               18.23      15.49*           77.49
-  Royale Kurozumi      25.98      10.73*           66.06
-  Lottes (v4, kept)     1.23        -               1.13
-  * mask-off figures, not comparable; see above.
-
-  Fixed-fallback presets: Guest 4.55, Easymode 9.61, Royale 23.20,
-  Kurozumi 17.51 (each now with its own jointly-fitted gamma LUT).
-
-FIVE DEFECTS FOUND AND FIXED
+This audit covers exactly five shader families and ten presets: one bare
+landscape/default preset and one "- TATE" preset per family. The runtime pack
+contains 14 filters, four gamma LUTs and five masks. No other preset contract
+is part of the release.
+
+  CRT Easymode / CRT Easymode - TATE
+  CRT Guest Advanced / CRT Guest Advanced - TATE
+  CRT Lottes / CRT Lottes - TATE
+  CRT Royale / CRT Royale - TATE
+  CRT Royale Kurozumi / CRT Royale Kurozumi - TATE
+
+The target is specifically 1920x1080 HDMI output, mask mode 1x, with no
+overscan or display-side resampling. Easymode, Guest Advanced, Royale and
+Royale Kurozumi require adaptive filter interface v7. Lottes deliberately uses
+a fixed H/V pair and gamma off.
+
+
+REFERENCE AND HARDWARE MODEL
 ----------------------------
-1. Royale's mask had lost ALL slot structure. The tile was built by averaging
-   the shader's 24x24 slot pattern to a hardware-legal size; that pattern is
-   antisymmetric under y -> y+12, so averaging cancelled the slot modulation
-   to exactly zero - and because mean-averaging is L2-optimal, the RMSE metric
-   REWARDED the destruction. Now a verbatim slice (12x6), slot preserved.
+Shader math is evaluated from the pinned reference modules in tools/targets/.
+The MiSTer side models the audited scaler and mask RTL rather than idealized
+floating-point convolution:
 
-2. Kurozumi's mask used the wrong encode exponent (2.2 hardcoded; its
-   lcd_gamma is 2.4): red +2.4%, blue -4.9% off target.
+  - 12-bit scaler phase is truncated to its upper eight bits;
+  - 256 signed 10-bit coefficient rows are applied with intermediate clamps;
+  - adaptive A/B coefficients use the RTL's single signed shift after the
+    weighted sum, preserving valid odd coefficients;
+  - adaptive control is the maximum gamma-LUT RGB channel;
+  - H, V and mask stages saturate in hardware order;
+  - v2 mask tokens use exact shift/add/truncate arithmetic;
+  - channel-aware LUTs are retained for Kurozumi.
 
-3. Kurozumi's grille is unrepresentable in one v2 token per pixel (both
-   non-selected channels share one nibble, but the target needs green ~1.01
-   and blue ~0.57). The single-token fit spent blue to buy luma and flattened
-   the R/B ripple to 61%. Dithering across two horizontal positions restores
-   it to 100% at 4.7x lower error (exact-arithmetic 14.5 -> 3.0 codes), with
-   no vertical structure added - a vertical dither would beat against the
-   4.5x scanline (measured up to 3.6 codes).
-
-4. Systematic truncation bias: MiSTer's FIR floors, so a unity-gain row
-   returns g-1 and every fitted level sat 1-4 codes dark. Refinement now runs
-   in the loop against the exact model.
-
-5. Black lift: the LUT generator flat-extrapolated below its lowest sample,
-   lifting codes 0..8 to 7.
-
-THE GAIN-SPLIT (the main fidelity gain)
----------------------------------------
-MiSTer's gamma LUT is both the tone curve AND the adaptive filter's control
-signal. Wherever a shader's beam-centre transfer clips, the LUT pins at 255 -
-and the control pins with it, so every input across that band renders with one
-frozen scanline profile while the true trough still varies. Easymode clips from
-x=0.849 (15% of the range); Lottes from 0.912.
-
-Fix: the LUT carries the PRE-clip beam divided by a gain G, and the mask
-carries G. The LUT keeps rising, the control keeps resolving levels, and
-saturation moves to the mask stage - which is where the shader clips too, so
-the clamp order matches as well. G is bounded by the mask's DARK multipliers
-(the shared nibble caps at 15/16), not the lit ones.
-
-  Easymode  G=1.105  ->  3.16 codes  (vs 8.37 with the plain factorization,
-                                      4.97 for v4)
-
-Independent confirmation: the search re-derives v4's 42f mask for Easymode and
-the 47e family for Lottes without being told. v4's authors found this
-empirically; it now falls out of the arithmetic.
-
-LOTTES: MEASURED, THEN LEFT ALONE
----------------------------------
-The shipped v4 Lottes scores 1.233 against a best-achievable 1.208 on the same
-metric - within 2%. Its gamma=off + gain-in-mask factorization already mirrors
-the shader's clamp order, and its two adaptive sets are nearly identical, which
-is why it degrades gracefully (1.13) on non-adaptive cores. A rebuild was built
-and rejected: no meaningful gain, real risk to the pack's best asset.
-
-REMAINING IRREDUCIBLE ERROR
----------------------------
-Kurozumi (25.98) is dominated by its own transfer saturating at x=0.738 - the
-top 26% of the input range collapses to one control value. A gain-split would
-help, but its clipping cascade has several internal clamps rather than one
-final clamp, so no single pre-clip beam is well defined; not attempted.
-
-Royale (18.23) remains dominated by the non-monotone scanline depth documented
-in the v5 audit, plus the mask's now-honest clamp-order cost.
-
-Both Default presets degrade badly on cores without adaptive filter support
-(77 and 66 codes) because their two coefficient sets differ greatly. Use the
-Fixed Compatibility presets there - this is why they exist.
-
-Two horizontal error sources remain invisible to every flat-field metric in
-this pack: Easymode's nonlinear local anti-ringing clamp and linear-vs-encoded
-filtering order (up to ~81 codes on a hard black/white edge). Both are
-horizontal-only and cannot be reproduced pointwise-safely by one fixed FIR and
-one pre-scaler LUT.
+All gamma searches include black, near-black and codes 253, 254 and 255. Mask
+errors are evaluated over the complete least-common-multiple supercell, not a
+convenient crop. Both best rigid phase alignment and strict output-pixel origin
+are measured; release masks must satisfy the strict origin contract.
 
 
-====================================================================
- HISTORICAL V5.2 AUDIT (CROPPED MASK METRIC) - ROW-SUM RULE
-====================================================================
+MEASURED DEFAULT FIDELITY
+-------------------------
+Endpoint-inclusive end-to-end RMS is measured through H, V, gamma and mask in
+8-bit output codes over the full periodic target. Lower is closer.
 
-The behavioral clipping insight remains valid. The mask numbers do not: this
-release scored only the upper-left hardware-sized crop rather than the full
-LCM supercell.
+  CRT Guest Advanced:       1.230 codes RMS
+  CRT Royale:              19.968 codes RMS
+  CRT Royale Kurozumi:     19.854 codes RMS
+  CRT Easymode:             3.591 codes RMS
+  CRT Lottes:               1.166 codes RMS
 
-The v5 design rule "keep every V row sum <= 256" was inherited from the v4
-Easymode post-mortem, where over-unity rows really were clipping highlights.
-Generalised into a hard constraint it became the single largest source of
-error in the pack - worth ~6 codes on Royale alone.
+Royale includes the measured finite-subline integration needed to keep its
+narrow source beam stable at 240p-to-1080p. This raises its source-shape RMS
+from the unconstrained fit, but removes the visible integer-line beat while
+remaining subject to the same clipping and full-period gates as every family.
 
-It is a FAR TOO STRONG PROXY for its own intent. The hardware does not clip
-on either endpoint's row sum; it clips on the BLENDED row times the input
-level. The dark set's blend weight is (256-lum)/256, which goes to zero
-exactly where the level is large - so a dark row sum of 511 cannot clip a
-flat field, while a pair that both look legal at 256 still can. The real
-ceiling on the dark set is the signed 10-bit coefficient format (the dark
-beam at phase 0 is nearly a delta, so its peak tap IS its row sum).
-
-Two further defects in the same code path:
-  - optimize_lut/fit_v_adaptive minimised error in ROW-SUM space with uniform
-    weight over x. Output error is u*(row-sum error)/256, so that is an
-    implicit 1/u^2 weighting in OUTPUT space - dark levels over-weighted up to
-    16x, dragging the bright endpoint down (Royale's bright trough row sat at
-    144 where the target wanted ~252: precisely its 105-code error at white).
-  - The u >= transfer constraint cost ~2.4 codes on its own AND blocked any
-    benefit from lifting the row cap.
-
-fit_v_joint replaces both with a joint fit of the shared gamma warp and the
-per-phase endpoint row sums, using the exact flat-field algebra
-    v = LUT(x)/256;  out(f,x) = min(A_f*(v - v^2) + B_f*v^2, 255)
-which is linear in (A,B), so each block solves exactly (the warp block is a
-dynamic program - globally optimal, not a search). Clip-safety is now MEASURED
-per candidate and the bright cap lowered until it holds, rather than assumed.
-
-RESULTS (exact model, mask off / through the mask)
---------------------------------------------------
-                    v5.1 -> v5.2 (mask off)    through the mask
-  Guest Advanced      2.68  ->  0.94  (-65%)     2.55 -> 1.16
-  Royale             15.49  ->  6.52  (-58%)    18.23 -> 16.56
-  Royale Kurozumi    10.77  ->  4.98  (-54%)    25.98 -> 24.62
-  Easymode v5         3.16 (gain-split path, unchanged)
-
-Gate 4 is now behavioural: "no flat field may clip" is tested directly by
-sweeping every input level through the blended row, with a separate format
-gate on the coefficient range (which the old rule had been covering by
-accident). Every shipped table passes: worst flat-field outputs are
-251.9 / 255.5 / 252.0 / 255.0 of 255, max |coeff| <= 511.
-
-HONEST NOTES
-------------
-- The masked figures improve far less than the mask-off ones because Royale's
-  and Kurozumi's remaining error is now MASK-dominated, not filter-dominated.
-  The Royale tile peaks at 1.625 encoded where a joint mask fit wants the
-  1.9375 ceiling; refitting the mask alone is worth far more than any further
-  filter work. That is the next job, and it is independent of the V/LUT fit.
-- Guest's non-adaptive degradation got WORSE (20.0 -> 27.0 codes): the joint
-  fit makes its two endpoint sets more different, which is the whole point on
-  an adaptive core and a liability on a v6 one. Its Fixed Compatibility preset
-  measures 4.55 codes and is the correct choice there.
-- Kurozumi's exact fit now misses the moire guard (7.74 vs 7.65). The builder
-  detected this and emitted CRT Royale Kurozumi - Anti-Moire automatically
-  (widened beam, 2.29). Note the guard only matters at FRACTIONAL vertical
-  scales; with vscale_mode=1 (integer scaling) it is moot.
+These values are approximation error against the source shader, not noise in
+the output. Higher values for Royale and Kurozumi primarily expose structures
+that MiSTer's four shared taps and v2 tokens cannot encode: wide bloom, large
+slot geometry, independent phosphor-channel multipliers and per-channel beam
+control.
 
 
-JOINT MASK REFIT
-----------------
-Historical warning: the 14.616 / -11.7% Royale result below is invalid under
-full-period scoring. The current regenerated Royale Default is 16.720 codes.
+EXACT 1080p STABILITY TEST
+--------------------------
+Line stability is simulated across complete 1080-line frames at:
 
-Fitting the mask to the shader's multipliers in isolation is the wrong
-objective: it leaves the mask unable to compensate for anything upstream. Two
-things it therefore cannot fix - the clamp-order mismatch (the shader clips
-clamp(B*m) after the mask; MiSTer clamps the V stage then saturates inside the
-mask), and the V/LUT residual, since the mask multiplies whatever the filters
-actually produce. The best token minimises the error of the PRODUCT.
+  240 source lines: scale = 1080/240 = 4.5
+  224 source lines: scale = 1080/224 = 4.821428571...
 
-fit_mask_joint refits each cell against the real simulated pre-mask output
-(exhaustive over all 7*16*16 tokens, exact mask arithmetic). It is self-gating
-- adopted only where it measurably wins:
+Input levels 25%, 50%, 75% and 100% are evaluated. The larger of peak-line and
+trough-line standard deviation is gated at 0.03*255 = 7.65 codes. Using a full
+frame is important: a short approximate scale can hide or exaggerate the beat
+period.
 
-  Royale            16.555 -> 14.616 codes (-11.7%), max 94.0 -> 66.2  ADOPTED
-  Guest Advanced     1.156 -> 1.156   no change                        declined
-  Easymode v5        3.156 -> 3.156   no change                        declined
-  Kurozumi          24.616 -> 24.733  slightly worse                   declined
+  Family                    224p -> 1080p    240p -> 1080p
+  CRT Easymode                    3.13             5.50
+  CRT Guest Advanced              2.65             5.00
+  CRT Lottes                      1.73             3.50
+  CRT Royale                      3.98             7.00
+  CRT Royale Kurozumi             6.65             6.00
 
-Royale was the case the analysis predicted (its tile peaked at 1.625 encoded
-against a 1.9375 ceiling - the mask had headroom the isolated fit never asked
-for). The three declines are informative rather than disappointing: they
-confirm those masks were already at their joint optimum. Easymode is the
-strongest check - the gain-split had independently arrived at 42f, which the
-joint refit then re-derived as optimal without being told.
 
-WHERE THE PACK STANDS (masked metric, the acceptance number)
-------------------------------------------------------------
-  Lottes (v4, kept)      1.23     verified already near-optimal (floor 1.21)
-  Guest Advanced         1.16
-  Easymode v5            3.16     (v4 Easymode: 4.97)
-  Royale                14.62
-  Royale Kurozumi       24.62
+FITTING AND ACCEPTANCE GATES
+----------------------------
+For the four adaptive families, fitting alternates the transfer LUT and dark /
+bright V endpoints against the integer model. A candidate is adopted only when
+the exact end-to-end score improves by the configured margin and the
+flat-field clipping invariant remains satisfied. The final mask is then
+refitted against the complete pipeline, followed by one mask-aware LUT pass
+with the same self-gate.
 
-Kurozumi is now the pack's weakest port and its error is NOT the mask or the
-filters - it is its own transfer saturating at x=0.738, which collapses the
-top 26% of the input range onto a single adaptive control value. Escaping that
-needs the gain-split, which needs a well-defined pre-clip beam; Kurozumi's
-clipping cascade has several internal clamps rather than one final clamp, so
-no such beam exists. Documented as the standing limit, not attempted.
+Every release build checks:
+
+  1. Filter, gamma, mask and preset syntax.
+  2. Exact inventory: 14 filters, 4 gamma LUTs, 5 masks, 10 presets.
+  3. Exact case-sensitive references from every preset.
+  4. Bare-default and TATE axis contracts.
+  5. Gamma monotonicity, endpoint coverage, plateau and step behavior.
+  6. Flat-field clip safety through maximum-RGB adaptive control.
+  7. Full-supercell RMS and worst individual-pixel error.
+  8. Strict-origin mask error and mask periodicity.
+  9. Full-frame 224p/240p-to-1080p peak/trough stability.
+ 10. RGB ramps, saturated colors, impulses, steps and checker patterns.
+
+
+PRESET AND INTERNAL-STAGE CONTRACTS
+-----------------------------------
+For Easymode, Guest Advanced, Royale and Royale Kurozumi, the landscape preset
+selects:
+
+  H         = family H filter
+  V         = family adaptive V filter
+  interlace = family no-scanline V filter
+  gamma     = family LUT
+  mask      = family mask
+  maskmode  = 1x
+
+TATE transposes H and adaptive V, uses the fixed H table for interlace, retains
+the same LUT/mask, and selects `maskmode=1x rotated`.
+
+Lottes uses its fixed H/V pair in both orientations, gamma off and the same
+strict-origin mask. These filter files are internal scaler stages; they do not
+represent additional user-facing presets.
+
+
+LOTTES STRICT-ORIGIN CORRECTION
+-------------------------------
+Lottes' source mask computes its selected channel from
+`px + 3*py + 2 (mod 6)`. At output pixel (0,0), the source therefore begins on
+green. A cyclically rolled 6x2 tile has identical averages and looks equivalent
+over a full screen, but it is not pixel-identical at a declared origin.
+
+The canonical mask is now anchored to the source phase:
+
+  row 0: 27e,27e,17e,17e,47e,47e
+  row 1: 17e,47e,47e,27e,27e,17e
+
+This preserves the gain-compensated Lottes factorization while removing the
+strict-origin phase error. Landscape and TATE use this same tile; MiSTer's
+rotated mask mode performs the orientation change.
+
+
+KNOWN IRREDUCIBLE DIFFERENCES
+-----------------------------
+Easymode: nonlinear inner-tap anti-ringing clamp, shader luma-assisted adaptive
+control and automatic arbitrary source-height branching.
+
+Guest Advanced: chroma-dependent beam behavior and spatial effects beyond one
+shared max-RGB adaptive scalar.
+
+Royale: nonseparable multi-pass bloom, full 24x24 slot geometry, convergence /+diffusion effects and nonlinear local behavior.
+
+Royale Kurozumi: Royale's structural limits plus independent PVM phosphor
+channel multipliers that a single v2 token cannot express.
+
+Lottes: true linear-light filtering and mask multiplication, nonseparable
+Horz3/Horz5/Horz7 plus Tri/Bloom kernels, curvature and off-screen sampling.
+
+The pack reports these boundaries because they are hardware limits, not fitting
+parameters. Within the available MiSTer pipeline, the canonical files are the
+single measured choices for the stated 1080p target.
+
+
+REPRODUCIBILITY
+---------------
+The deterministic model, fitters and validators live in tools/. Source and RTL
+revisions are pinned in SOURCES.txt. Generated families can be rebuilt with:
+
+  python tools/build_port.py guest
+  python tools/build_port.py royale
+  python tools/build_port.py kurozumi
+  python tools/build_port.py easymode
+
+Lottes uses its audited fixed tables and strict-origin mask directly.

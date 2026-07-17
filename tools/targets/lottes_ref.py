@@ -487,15 +487,15 @@ def notes():
         "only by their +/-2 taps, worth exp2(-3*4) = 2.4e-4 relative. The "
         "meaningful horizontal degree of freedom is the Horz7 (bloom) share.",
 
-        "H-BLEND CHOICE vs v4 (LOOK RISK -- read this before shipping v5). "
-        "The shipped v4 H header states 'Horz5/Horz7 alpha = 0.163618283034'. "
+        "H-BLEND CHOICE (LOOK RISK). The retained H header states "
+        "'Horz5/Horz7 alpha = 0.163618283034'. "
         "This module's LS-optimal separable share is 0.2208. Neither "
         "beam-centre weighting (0.1823), plain period-mean (0.2279), nor "
-        "vtot^2/vtot^3 weighting (0.2145/0.2092) reproduces v4's 0.1636, so v4 "
-        "used a different rank-one objective. Consequence: a v5 H table fitted "
+        "vtot^2/vtot^3 weighting (0.2145/0.2092) reproduces 0.1636, so the "
+        "retained table used a different rank-one objective. A newly fitted "
         "from this h_kernel will be measurably SOFTER horizontally than the "
-        "gold-standard v4 H table. Since the brief is 'beat the RMSE without "
-        "changing the look', either keep the v4 H table verbatim (it is not "
+        "gold-standard retained H table. Since the brief is 'beat the RMSE "
+        "without changing the look', keep that H table verbatim (it is not "
         "what the flat-field RMSE measures anyway) or override alpha_H7 to "
         "0.1636 before fitting.",
 

@@ -48,6 +48,8 @@ class FamilySpec:
     key: str
     file_base: str
     gamma_name: str | None
+    vertical_name: str
+    adaptive: bool = True
 
 
 @dataclass(frozen=True)
@@ -61,15 +63,20 @@ class LoadedFamily:
 
 FAMILIES = (
     FamilySpec("guest", "CRT Guest Advanced (Port)",
-               "CRT Guest Advanced (Port).txt"),
+               "CRT Guest Advanced (Port).txt",
+               "CRT Guest Advanced (Port)_V Adaptive.txt"),
     FamilySpec("royale", "CRT Royale (Port)",
-               "CRT Royale (Port).txt"),
+               "CRT Royale (Port).txt",
+               "CRT Royale (Port)_V Adaptive.txt"),
     FamilySpec("kurozumi", "CRT Royale Kurozumi (Port)",
-               "CRT Royale Kurozumi (Port).txt"),
-    FamilySpec("easymode", "CRT Easymode v5 (Port)",
-               "CRT Easymode v5 (Port).txt"),
+               "CRT Royale Kurozumi (Port).txt",
+               "CRT Royale Kurozumi (Port)_V Adaptive.txt"),
+    FamilySpec("easymode", "CRT Easymode (Port)",
+               "CRT Easymode (Port).txt",
+               "CRT Easymode (Port)_V Adaptive.txt"),
     # Lottes has no LUT in the pack.  Its presets use the input codes directly.
-    FamilySpec("lottes", "CRT Lottes (Port)", None),
+    FamilySpec("lottes", "CRT Lottes (Port)", None,
+               "CRT Lottes (Port)_V.txt", adaptive=False),
 )
 
 
@@ -120,13 +127,15 @@ def identity_lut() -> np.ndarray:
 def load_family(root: str, spec: FamilySpec) -> tuple[LoadedFamily, list[str]]:
     """Load one family and return it with any hard format/range problems."""
     h_path = os.path.join(root, "Filters", f"{spec.file_base}_H.txt")
-    v_path = os.path.join(root, "Filters", f"{spec.file_base}_V Adaptive.txt")
+    v_path = os.path.join(root, "Filters", spec.vertical_name)
     h_file = fileio.parse_filter(h_path)
     v_file = fileio.parse_filter(v_path)
     problems = fileio.validate_filter(h_file, os.path.relpath(h_path, root))
     problems += fileio.validate_filter(v_file, os.path.relpath(v_path, root))
-    if not v_file.adaptive or len(v_file.sets) != 2:
-        raise ValueError(f"{spec.key}: expected a two-set adaptive V filter")
+    expected_sets = 2 if spec.adaptive else 1
+    if v_file.adaptive != spec.adaptive or len(v_file.sets) != expected_sets:
+        mode = "two-set adaptive" if spec.adaptive else "single-set fixed"
+        raise ValueError(f"{spec.key}: expected a {mode} V filter")
 
     if spec.gamma_name is None:
         lut = identity_lut()
@@ -137,7 +146,10 @@ def load_family(root: str, spec: FamilySpec) -> tuple[LoadedFamily, list[str]]:
 
     h = h_file.sets[0].astype(np.int64)
     dark = v_file.sets[0].astype(np.int64)
-    bright = v_file.sets[1].astype(np.int64)
+    # Keep one loaded shape for the diagnostics, but do not run a fixed table
+    # through the adaptive coefficient interpolator: its numeric scaling is a
+    # different hardware format.
+    bright = (v_file.sets[1] if spec.adaptive else v_file.sets[0]).astype(np.int64)
     max_coef = max(int(np.abs(x).max()) for x in (h, dark, bright))
     if max_coef > HARD_LIMITS["coefficient_abs"]:
         problems.append(f"{spec.key}: signed 10-bit coefficient overflow {max_coef}")
@@ -196,9 +208,14 @@ def simulate_pipeline(source_rgb: np.ndarray, family: LoadedFamily,
         nearest_rgb = hstage[nearest, xx, :]
         shared_ctrl = nearest_rgb.max(axis=1)
         for cc in range(3):
-            ctrl = shared_ctrl if control_mode == "shared_max" else nearest_rgb[:, cc]
-            out[:, xx, cc] = mm.fir_1d_adaptive(
-                hstage[:, xx, cc], family.dark, family.bright, ypos, ctrl)
+            if family.spec.adaptive:
+                ctrl = (shared_ctrl if control_mode == "shared_max"
+                        else nearest_rgb[:, cc])
+                out[:, xx, cc] = mm.fir_1d_adaptive(
+                    hstage[:, xx, cc], family.dark, family.bright, ypos, ctrl)
+            else:
+                out[:, xx, cc] = mm.fir_1d(
+                    hstage[:, xx, cc], family.dark, ypos)
     return out
 
 
@@ -220,9 +237,13 @@ def selector_boundary_response(family: LoadedFamily,
     def run(pos: np.ndarray, ctrl: int) -> np.ndarray:
         result = np.empty(3, dtype=np.int64)
         for cc in range(3):
-            result[cc] = mm.fir_1d_adaptive(
-                lines[:, cc], family.dark, family.bright, pos,
-                np.array([ctrl], dtype=np.int64))[0]
+            if family.spec.adaptive:
+                result[cc] = mm.fir_1d_adaptive(
+                    lines[:, cc], family.dark, family.bright, pos,
+                    np.array([ctrl], dtype=np.int64))[0]
+            else:
+                result[cc] = mm.fir_1d(
+                    lines[:, cc], family.dark, pos)[0]
         return result
 
     before = run(p127, ctrl_upper)

@@ -1,11 +1,11 @@
-"""Build the complete MiSTer file set for one ported shader.
+"""Build one canonical 1080p MiSTer shader preset pair.
 
 Usage: py -3 build_port.py <guest|royale|kurozumi|easymode>
 
-Emits into the pack folders (Filters/, Gamma/, Shadow_Masks/, Presets/):
-  H filter, V Adaptive, V Fixed, V No Scanlines, gamma LUT, mask(s), presets
-per DESIGN.md. Prints fitting/moire diagnostics; validate_port.py does the
-full acceptance run.
+Emits only the runtime assets used by ``<shader>.ini`` and
+``<shader> - TATE.ini``: H, adaptive V, interlace-safe V, one gamma LUT, one
+1080p mask, and the two presets.  Prints fitting/moire diagnostics;
+validate_port.py performs the full acceptance run.
 """
 
 from __future__ import annotations
@@ -46,9 +46,6 @@ SHADERS = {
         # exact optimum under every weighting tested.
         "gain": None,
         "mask_strategy": None,
-        # A two-phase selector-only regularization removes the nearest-line
-        # control discontinuity with a small flat-field fidelity tradeoff.
-        "edge_stable": {"kind": "phase", "radius": 2, "strength": 1.0},
     },
     "royale": {
         "module": "royale_ref",
@@ -61,11 +58,14 @@ SHADERS = {
         # repeats cancels the slot modulation outright and leaves an aperture
         # grille. Take a verbatim slice instead and keep the slot.
         "mask_strategy": {"period": (12, 6), "kind": "verbatim"},
-        # Royale's narrow bright beam needs a global reduction in adaptation;
-        # local selector smoothing alone aliases badly at fractional scales.
-        # Move dark toward bright only so legal high-gain dark rows are never
-        # imported into the highlight endpoint (which would clip).
-        "edge_stable": {"kind": "dark_to_bright", "strength": 0.854},
+        # At 1080p, Royale's source-faithful beam is just narrow enough to
+        # alternate between adjacent integer output-line placements at common
+        # 224p/240p scale factors.  Blend in the smallest safely passing
+        # sub-line integration fit (measured over the complete 1080-line
+        # frame), retaining substantially more reference fidelity than using
+        # the softened fit by itself.
+        "stability_sigma": 0.16,
+        "stability_blend": 0.55,
     },
     "kurozumi": {
         "module": "kurozumi_ref",
@@ -78,15 +78,11 @@ SHADERS = {
         # The old horizontally-dithered pair was accurate only after averaging
         # partner pixels, while an individual pixel could be over 120 codes off.
         "mask_strategy": {"period": (1, 2), "kind": "mean"},
-        # Keep that lower-frequency perceptual compromise as an explicit option
-        # for viewers who prefer pair-averaged PVM colour over local accuracy.
-        "perceptual_mask_strategy": {"period": (1, 2), "dither": 2},
-        "moire_soften_candidates": [0.05, 0.08, 0.12, 0.16, 0.22],
     },
     "easymode": {
         "module": "easymode_ref",
-        "file_base": "CRT Easymode v5 (Port)",
-        "preset_base": "CRT Easymode v5",
+        "file_base": "CRT Easymode (Port)",
+        "preset_base": "CRT Easymode",
         "shader_name": "crt-easymode (Easymode, GPL)",
         "lut_channels": False,
         # BRIGHT_BOOST=1.2 clips the beam centre from x=0.849, which would pin
@@ -95,61 +91,50 @@ SHADERS = {
         # saturation moves to the mask stage, where the shader also clips.
         "gain": 1.105,
         "mask_strategy": None,
-        "edge_stable": {"kind": "global", "strength": 0.70},
     },
 }
 
 MOIRE_LIMIT = 0.03 * 255          # trough-stddev acceptance, output codes
+OUTPUT_LINES = 1080
+SOURCE_HEIGHTS = (224, 240)
 
 
-class SoftenedRef:
-    """Proxy that widens the vertical profile by Gaussian-averaging over f."""
+class _SublineIntegratedRef:
+    """Reference wrapper modelling the panel's finite vertical sample area."""
 
     def __init__(self, ref, sigma: float):
-        self._ref = ref
-        self._sigma = sigma
-        self._offs = np.array([-2.0, -1.0, 0.0, 1.0, 2.0]) * sigma
-        w = np.exp(-0.5 * np.array([-2.0, -1.0, 0.0, 1.0, 2.0]) ** 2)
-        self._w = w / w.sum()
+        self.ref = ref
+        offsets = np.array([-2.0, -1.0, 0.0, 1.0, 2.0])
+        weights = np.exp(-0.5 * offsets * offsets)
+        self.offsets = offsets * sigma
+        self.weights = weights / weights.sum()
 
     def ref_vertical(self, f, x):
-        vals = []
-        for o in self._offs:
-            fo = abs(f + o) % 1.0
-            fo = min(fo, 1.0 - fo)
-            vals.append(self._ref.ref_vertical(fo, x))
-        return float((np.array(vals) * self._w).sum())
+        values = []
+        for offset in self.offsets:
+            wrapped = abs(f + offset) % 1.0
+            wrapped = min(wrapped, 1.0 - wrapped)
+            values.append(self.ref.ref_vertical(wrapped, x))
+        return float(np.dot(values, self.weights))
 
     def __getattr__(self, name):
-        return getattr(self._ref, name)
+        return getattr(self.ref, name)
 
 
 def v_moire(dark, bright, lut, xs=(0.25, 0.5, 0.75, 1.0)) -> float:
-    """Worst trough-stddev (codes) across gray levels and 4.5x / 4.821x."""
+    """Worst full-frame trough/peak variation for common 1080p sources."""
     worst = 0.0
     for x in xs:
         code = int(round(x * 255))
-        for scale, n in ((4.5, 450), (4.821, 482)):
-            prof = mm.flat_field_profile(code, scale, dark, bright, lut, n_out=n)
-            m = mm.moire_metrics(prof, scale)
-            worst = max(worst, m["trough_std"], m["peak_std"])
+        for source_lines in SOURCE_HEIGHTS:
+            scale = OUTPUT_LINES / source_lines
+            for channel in range(3):
+                prof = mm.flat_field_profile(
+                    code, scale, dark, bright, lut, n_out=OUTPUT_LINES,
+                    channel=channel)
+                m = mm.moire_metrics(prof, scale)
+                worst = max(worst, m["trough_std"], m["peak_std"])
     return worst
-
-
-def anti_moire_sigmas(cfg: dict, default_moire: float) -> tuple[float, ...]:
-    """Return the deterministic softening search for an optional safety preset.
-
-    A configured candidate list means the Anti-Moire preset is part of that
-    family's generated asset matrix, even when a newly fitted Default happens
-    to pass the guard.  Otherwise a failing Default gets the generic fallback
-    search.  This prevents incremental rebuilds from silently retaining a
-    filter fitted against an older gamma/control LUT.
-    """
-    if "moire_soften_candidates" in cfg:
-        return tuple(float(s) for s in cfg["moire_soften_candidates"])
-    if default_moire > MOIRE_LIMIT:
-        return (0.08, 0.16)
-    return ()
 
 
 def build(key: str) -> None:
@@ -266,6 +251,27 @@ def build(key: str) -> None:
         print(f"[{key}] mask-aware LUT pass rejected: flat-field clipping")
         minfo["mask_aware_lut"] = False
 
+    # Royale alone needs a narrowly scoped 1080p stability constraint.  Fit a
+    # finite-subline reference using the FINISHED LUT, blend it into the exact
+    # shader fit, then give the mask one last chance to follow the constrained
+    # beam.  The full-frame guard below remains the authority.
+    if "stability_blend" in cfg:
+        alpha = cfg["stability_blend"]
+        integrated = _SublineIntegratedRef(ref, cfg["stability_sigma"])
+        soft_dark, soft_bright = fitting.fit_v_adaptive(
+            integrated, lut.max(axis=1))
+        dark = np.rint((1.0 - alpha) * dark + alpha * soft_dark).astype(np.int64)
+        bright = np.rint(
+            (1.0 - alpha) * bright + alpha * soft_bright).astype(np.int64)
+        constrained_before, _ = fitting.rmse_exact_masked(
+            ref, dark, bright, h, lut, tokens, m_target)
+        constrained_tokens, constrained_after = fitting.fit_mask_joint(
+            ref, lut, dark, bright, h, tokens, m_target)
+        if constrained_after < constrained_before:
+            tokens = constrained_tokens
+        print(f"[{key}] 1080p stability blend: {alpha:.0%} integrated beam, "
+              f"masked RMSE {min(constrained_before, constrained_after):.3f} codes")
+
     gain_note = (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
                  f"the mask carries {gain:.3f}" if gain else
                  "Monotone adaptive-control warp co-optimized with the V fit")
@@ -275,47 +281,27 @@ def build(key: str) -> None:
         "Co-optimized with the adaptive V fit and refined against MiSTer's",
         "exact truncating arithmetic; pair with the matching (Port) files"])
     made.append(gpath)
-    lut_ctrl = lut.max(axis=1)                    # adaptive control = max RGB
-
-    def write_mask_variant(filename: str, variant_tokens: list[list[str]],
-                           notes: list[str]) -> None:
-        mpath = os.path.join(ROOT, "Shadow_Masks", filename)
-        fileio.write_mask(mpath, fileio.MaskFile(
-            [f"Name: {os.path.splitext(filename)[0]}", provenance,
-             "Fitted in encoded space with MiSTer's exact saturating mask arithmetic",
-             *notes], len(variant_tokens[0]), len(variant_tokens), variant_tokens))
-        made.append(mpath)
-
     mname = f"{fb}.txt"
-    write_mask_variant(mname, tokens, [
-        (f"Carries the {gain:.3f} gain-split factor; pair only with the "
-         "matching (Port) gamma" if gain else
-         "Jointly fitted with the matching adaptive gamma and V filter"),
-        "Pixel-local objective over the complete hardware/reference LCM supercell",
-        f"Tile kind: {minfo['kind']}",
-    ])
-
-    perceptual_name = None
-    if cfg.get("perceptual_mask_strategy"):
-        perceptual_tokens, pinfo = fitting.fit_mask_tile(
-            ref, gain=gain or 1.0, strategy=cfg["perceptual_mask_strategy"])
-        perceptual_name = f"{fb} Perceptual Dither.txt"
-        write_mask_variant(perceptual_name, perceptual_tokens, [
-            "Optional pair-averaged perceptual dither; not pixel-local",
-            "Partner columns integrate toward the PVM phosphor target while each",
-            "individual pixel carries a deliberate high-frequency colour residual",
-            f"Pair-averaged isolated-mask error: {pinfo['err_dither']:.2f} codes",
-        ])
-        rp, ep = fitting.rmse_exact_masked(
-            ref, dark, bright, h, lut, perceptual_tokens, m_target)
-        print(f"[{key}] perceptual-dither mask: pair-average "
-              f"{pinfo['err_dither']:.2f}, pixel-local pipeline RMSE {rp:.3f} "
-              f"(max {ep:.1f})")
+    mpath = os.path.join(ROOT, "Shadow_Masks", mname)
+    fileio.write_mask(mpath, fileio.MaskFile(
+        [f"Name: {fb}", provenance,
+         "Fitted in encoded space with MiSTer's exact saturating mask arithmetic",
+         (f"Carries the {gain:.3f} gain-split factor; pair only with the "
+          "matching (Port) gamma" if gain else
+          "Jointly fitted with the matching adaptive gamma and V filter"),
+         "Pixel-local objective over the complete hardware/reference LCM supercell",
+         f"Tile kind: {minfo['kind']}"],
+        len(tokens[0]), len(tokens), tokens))
+    made.append(mpath)
 
     # ---- V filters ----------------------------------------------------------
     moire = v_moire(dark, bright, lut)
-    print(f"[{key}] adaptive V moire (worst trough-std): {moire:.2f} codes "
+    print(f"[{key}] adaptive V moire (worst peak/trough stddev): {moire:.2f} codes "
           f"(limit {MOIRE_LIMIT:.2f})")
+    if moire > MOIRE_LIMIT:
+        raise RuntimeError(
+            f"{key}: canonical adaptive profile exceeds the 1080p moire guard "
+            f"({moire:.2f} > {MOIRE_LIMIT:.2f} codes)")
 
     header_common = [f"Original shader: {provenance}",
                      "Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)"]
@@ -329,101 +315,6 @@ def build(key: str) -> None:
                       "Secondary coefficients (maximum RGB = 255)"])
     made.append(vpath)
 
-    # Fixed fallback gets its own jointly-fitted LUT: without an adaptive
-    # control the model is rank-1 and its optimal warp differs from the
-    # adaptive one (sharing the adaptive LUT costs several codes of RMSE).
-    # Its mask and final LUT are also optimized as a PAIR instead of silently
-    # reusing assets calibrated for the adaptive pipeline.
-    fixed, fixed_lut = fitting.fit_v_fixed_paired(ref, channels=cfg["lut_channels"])
-    for _ in range(2):
-        fixed_lut2 = fitting.refine_lut_exact(
-            ref, fixed_lut, h, fixed, fixed,
-            channel_aware=cfg["lut_channels"])
-        if maskoff_metric(fixed, fixed, fixed_lut2) >= \
-                maskoff_metric(fixed, fixed, fixed_lut) - 0.005:
-            break
-        fixed_lut = fixed_lut2
-    fixed_base, _ = fitting.rmse_exact_masked(
-        ref, fixed, fixed, h, fixed_lut, tokens, m_target)
-    fixed_tokens, fixed_mask_err = fitting.fit_mask_joint(
-        ref, fixed_lut, fixed, fixed, h, tokens, m_target)
-    fixed_lut_m = fitting.refine_lut_masked(
-        ref, fixed_lut, h, fixed, fixed, fixed_tokens, m_target, radius=4,
-        channel_aware=cfg["lut_channels"])
-    fixed_tokens_m, fixed_pair_err = fitting.fit_mask_joint(
-        ref, fixed_lut_m, fixed, fixed, h, fixed_tokens, m_target)
-    fixed_candidates = [
-        (fixed_base, fixed_lut, tokens, "adaptive mask retained"),
-        (fixed_mask_err, fixed_lut, fixed_tokens, "fixed mask"),
-        (fixed_pair_err, fixed_lut_m, fixed_tokens_m, "mask-aware fixed pair"),
-    ]
-    fixed_err, fixed_lut, fixed_tokens, fixed_choice = min(
-        fixed_candidates, key=lambda item: item[0])
-    print(f"[{key}] fixed fallback: masked RMSE {fixed_base:.3f} -> "
-          f"{fixed_err:.3f} codes ({fixed_choice}); mask-off "
-          f"{maskoff_metric(fixed, fixed, fixed_lut):.3f}")
-    fixed_mask_name = f"{fb} Fixed.txt"
-    write_mask_variant(fixed_mask_name, fixed_tokens, [
-        "Dedicated pixel-local mask for the non-adaptive rank-1 pipeline",
-        f"Selected by whole-pipeline self-gate: {fixed_choice}",
-    ])
-    fpath = os.path.join(ROOT, "Filters", f"{fb}_V Fixed.txt")
-    fileio.write_filter(fpath, fileio.FilterFile(
-        [f"Name: {fb}_V Fixed"] + header_common +
-        ["Best single-profile compromise for non-adaptive (v6) cores",
-         f"Pair with Gamma/{fb} Fixed.txt and Shadow_Masks/{fixed_mask_name}"],
-        False, True, [fixed]))
-    made.append(fpath)
-    fgpath = os.path.join(ROOT, "Gamma", f"{fb} Fixed.txt")
-    fileio.write_gamma(fgpath, fixed_lut, header=[
-        f"Name: {fb} Fixed", provenance,
-        "Rank-1 transfer fitted jointly with the fixed V table and refined",
-        "through its dedicated full-period mask; use only with that pair"])
-    made.append(fgpath)
-
-    # gamma=off is a real supported pipeline.  Fit V endpoints and a mask for
-    # the identity LUT, compare that pair with a mask-only recalibration of the
-    # canonical tables, and keep the exact whole-pipeline winner.
-    identity_lut = np.repeat(np.arange(256, dtype=np.int64)[:, None], 3, axis=1)
-    ng_base, _ = fitting.rmse_exact_masked(
-        ref, dark, bright, h, identity_lut, tokens, m_target)
-    ng_base_tokens, ng_base_mask_err = fitting.fit_mask_joint(
-        ref, identity_lut, dark, bright, h, tokens, m_target)
-    ng_dark_fit, ng_bright_fit, ng_info = fitting.fit_v_for_lut_safe(
-        ref, identity_lut)
-    ng_fit_tokens, ng_fit_err = fitting.fit_mask_joint(
-        ref, identity_lut, ng_dark_fit, ng_bright_fit, h, tokens, m_target)
-    ng_candidates = [
-        (ng_base, dark, bright, tokens, "adaptive pair retained"),
-        (ng_base_mask_err, dark, bright, ng_base_tokens, "identity-mask recalibration"),
-        (ng_fit_err, ng_dark_fit, ng_bright_fit, ng_fit_tokens,
-         "identity-LUT V/mask co-fit"),
-    ]
-    ng_err, ng_dark, ng_bright, ng_tokens, ng_choice = min(
-        ng_candidates, key=lambda item: item[0])
-    print(f"[{key}] no-gamma pipeline: masked RMSE {ng_base:.3f} -> "
-          f"{ng_err:.3f} codes ({ng_choice}); worst flat "
-          f"{fitting.worst_flat_field_output(identity_lut, ng_dark, ng_bright):.1f}")
-    ng_detail = (f"Safe-fit bright cap {ng_info['cap_bright']:.0f}"
-                 if ng_choice == "identity-LUT V/mask co-fit" else
-                 "Canonical endpoints retained; the mask-only calibration won")
-    ng_vname = f"{fb}_V Adaptive No Gamma.txt"
-    ng_vpath = os.path.join(ROOT, "Filters", ng_vname)
-    fileio.write_filter(ng_vpath, fileio.FilterFile(
-        [f"Name: {fb}_V Adaptive No Gamma"] + header_common + [
-            "Dedicated identity-LUT (gamma=off) endpoint pair",
-            f"Whole-pipeline self-gate selected: {ng_choice}",
-            f"{ng_detail}; pair with its No Gamma mask",
-        ], True, True, [ng_dark, ng_bright]),
-        set_comments=["Primary coefficients (maximum RGB = 0)",
-                      "Secondary coefficients (maximum RGB = 255)"])
-    made.append(ng_vpath)
-    ng_mask_name = f"{fb} No Gamma.txt"
-    write_mask_variant(ng_mask_name, ng_tokens, [
-        "Dedicated pixel-local mask for gamma=off / identity LUT",
-        f"Selected by whole-pipeline self-gate: {ng_choice}",
-    ])
-
     nos = fitting.no_scanline_table(ref)
     npath = os.path.join(ROOT, "Filters", f"{fb}_V No Scanlines.txt")
     fileio.write_filter(npath, fileio.FilterFile(
@@ -432,82 +323,6 @@ def build(key: str) -> None:
         False, True, [nos]))
     made.append(npath)
 
-    # Optional pattern-stable profile.  Default remains the closest flat-field
-    # shader match; this variant bounds the nearest-line selector discontinuity
-    # for hard sprite/text edges and must also pass the fractional-scale guard.
-    edge_name = None
-    edge_cfg = cfg.get("edge_stable")
-    if edge_cfg:
-        if edge_cfg["kind"] == "phase":
-            ed, eb = fitting.stabilize_adaptive_selector(
-                dark, bright, radius=edge_cfg["radius"],
-                strength=edge_cfg["strength"])
-            edge_method = (f"phase-local selector regularization, radius "
-                           f"{edge_cfg['radius']}/256 line")
-        elif edge_cfg["kind"] == "global":
-            ed, eb = fitting.blend_adaptive_endpoints(
-                dark, bright, edge_cfg["strength"])
-            edge_method = (f"global endpoint blend, strength "
-                           f"{edge_cfg['strength']:.2f}")
-        elif edge_cfg["kind"] == "dark_to_bright":
-            ed, eb = fitting.blend_dark_toward_bright(
-                dark, bright, edge_cfg["strength"])
-            edge_method = (f"clip-safe dark-to-bright endpoint blend, strength "
-                           f"{edge_cfg['strength']:.3f}")
-        else:
-            raise ValueError(f"unknown edge-stable strategy {edge_cfg['kind']!r}")
-        edge_moire = v_moire(ed, eb, lut)
-        edge_rmse, _ = fitting.rmse_exact_masked(
-            ref, ed, eb, h, lut, tokens, m_target)
-        if (fitting.worst_flat_field_output(lut, ed, eb) <= 255.5
-                and edge_moire <= MOIRE_LIMIT):
-            edge_name = f"{fb}_V Adaptive Edge Stable.txt"
-            edge_path = os.path.join(ROOT, "Filters", edge_name)
-            fileio.write_filter(edge_path, fileio.FilterFile(
-                [f"Name: {fb}_V Adaptive Edge Stable"] + header_common + [
-                    f"Pattern-tuned: {edge_method}",
-                    "Reduces nearest-line control switching on hard nonuniform edges",
-                    f"Masked flat-field RMSE {edge_rmse:.2f}; moire {edge_moire:.2f} codes",
-                ], True, True, [ed, eb]),
-                set_comments=["Primary coefficients (maximum RGB = 0)",
-                              "Secondary coefficients (maximum RGB = 255)"])
-            made.append(edge_path)
-            print(f"[{key}] edge-stable variant: RMSE {edge_rmse:.3f}, "
-                  f"moire {edge_moire:.2f} -- emitted")
-        else:
-            print(f"[{key}] edge-stable candidate rejected (moire "
-                  f"{edge_moire:.2f} or clipping)")
-
-    # ---- anti-moire safety variant -----------------------------------------
-    # Explicitly configured families always regenerate this optional profile.
-    # Its coefficients depend on the current LUT/control warp, so leaving an
-    # older file in place merely because Default now passes would create a
-    # stale cross-generation pair.
-    anti_name = None
-    anti_sigmas = anti_moire_sigmas(cfg, moire)
-    if anti_sigmas:
-        for sigma in anti_sigmas:
-            sref = SoftenedRef(ref, sigma)
-            d2, b2 = fitting.fit_v_adaptive(sref, lut_ctrl)
-            m2 = v_moire(d2, b2, lut)
-            print(f"[{key}]   soften sigma={sigma}: moire {m2:.2f}")
-            if m2 <= MOIRE_LIMIT:
-                anti_name = f"{fb}_V Adaptive Anti-Moire.txt"
-                apath = os.path.join(ROOT, "Filters", anti_name)
-                fileio.write_filter(apath, fileio.FilterFile(
-                    [f"Name: {fb}_V Adaptive Anti-Moire"] + header_common +
-                    [f"Display-tuned: beam widened (sigma {sigma} lines) for extra",
-                     "fractional-scale stability; passes the moire guard; not pixel-exact"],
-                    True, True, [d2, b2]),
-                    set_comments=["Primary coefficients (maximum RGB = 0)",
-                                  "Secondary coefficients (maximum RGB = 255)"])
-                made.append(apath)
-                break
-        if anti_name is None:
-            raise RuntimeError(
-                f"{key}: configured Anti-Moire search did not pass the "
-                f"{MOIRE_LIMIT:.2f}-code guard")
-
     # ---- H filter ------------------------------------------------------------
     hpath = os.path.join(ROOT, "Filters", f"{fb}_H.txt")
     fileio.write_filter(hpath, fileio.FilterFile(
@@ -515,8 +330,8 @@ def build(key: str) -> None:
     made.append(hpath)
 
     # ---- presets ------------------------------------------------------------------
-    def preset(name: str, entries: dict[str, str]) -> None:
-        p = os.path.join(ROOT, "Presets", f"{pb} - {name}.ini")
+    def preset(filename: str, entries: dict[str, str]) -> None:
+        p = os.path.join(ROOT, "Presets", filename)
         fileio.write_preset(p, entries)
         made.append(p)
 
@@ -529,23 +344,14 @@ def build(key: str) -> None:
         "mask": mname,
         "maskmode": "1x",
     }
-    preset("Default", base)
-    preset("Fixed Compatibility", {**base, "vfilter": f"{fb}_V Fixed.txt",
-                                   "gamma": f"{fb} Fixed.txt",
-                                   "mask": fixed_mask_name})
-    preset("No Gamma", {**base, "vfilter": ng_vname,
-                         "gamma": "off", "mask": ng_mask_name})
-    preset("TATE", {**base,
-                    "hfilter": f"{fb}_V Adaptive.txt",
-                    "vfilter": f"{fb}_H.txt",
-                    "ifilter": f"{fb}_H.txt",
-                    "maskmode": "1x rotated"})
-    if edge_name:
-        preset("Edge Stable", {**base, "vfilter": edge_name})
-    if anti_name:
-        preset("Anti-Moire", {**base, "vfilter": anti_name})
-    if perceptual_name:
-        preset("Perceptual Dither", {**base, "mask": perceptual_name})
+    preset(f"{pb}.ini", base)
+    preset(f"{pb} - TATE.ini", {
+        **base,
+        "hfilter": f"{fb}_V Adaptive.txt",
+        "vfilter": f"{fb}_H.txt",
+        "ifilter": f"{fb}_H.txt",
+        "maskmode": "1x rotated",
+    })
 
     print(f"[{key}] wrote {len(made)} files")
     for m in made:
