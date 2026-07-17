@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
+import mister_model as mm
 import quantize
 
 PHASES = 256
@@ -36,6 +37,29 @@ def _transfer(ref, x: float, channel: str | None = None) -> float:
 def _ref_vertical(ref, f: float, x: float) -> float:
     # Profiles are symmetric about f=0.5; some modules only cover 0..0.5.
     return ref.ref_vertical(min(f, 1.0 - f) if f > 0.5 else f, x)
+
+
+def _ref_vertical_unclipped(ref, f: float, x: float) -> float:
+    """Pre-clip beam value B(f, x); falls back to the clipped value."""
+    fn = getattr(ref, "ref_vertical_unclipped", None)
+    if fn is None:
+        return _ref_vertical(ref, f, x)
+    return fn(min(f, 1.0 - f) if f > 0.5 else f, x)
+
+
+def _transfer_unclipped(ref, x: float) -> float:
+    fn = getattr(ref, "transfer_unclipped", None)
+    return fn(x) if fn is not None else _transfer(ref, x)
+
+
+def has_headroom(ref) -> bool:
+    """True when the shader's beam-centre transfer clips before x=1.
+
+    Such shaders (Lottes brightBoost/bloom gain, Easymode BRIGHT_BOOST,
+    Kurozumi levels_contrast) cannot use the plain LUT-carries-transfer
+    factorization without saturating the adaptive control — see fit_gain_split.
+    """
+    return _transfer_unclipped(ref, 1.0) > 1.0 + 1e-9
 
 
 # ------------------------------------------------------------------ gamma
@@ -90,8 +114,11 @@ def optimize_lut(ref, channels: bool = False, iters: int = 8) -> np.ndarray:
     u = np.minimum(np.maximum.accumulate(np.maximum(u, tr)), 1.0)
 
     # Expand to a full 256-entry LUT; per-channel via the channel/neutral ratio.
+    # Anchor x=0 on the real transfer: np.interp flat-extrapolates below xs[0],
+    # which would otherwise lift black to the xs[0] level (a visible black lift).
     xfull = np.arange(256) / 255.0
-    ufull = np.interp(xfull, xs, u)
+    ufull = np.interp(xfull, np.concatenate([[0.0], xs]),
+                      np.concatenate([[_transfer(ref, 0.0)], u]))
     ufull = np.minimum(np.maximum.accumulate(
         np.maximum(ufull, [_transfer(ref, x) for x in xfull])), 1.0)
     out = np.zeros((256, 3), dtype=np.int64)
@@ -104,6 +131,380 @@ def optimize_lut(ref, channels: bool = False, iters: int = 8) -> np.ndarray:
             vals = 255.0 * ufull
         out[:, c] = np.clip(np.round(np.maximum.accumulate(vals)), 0, 255)
     return out
+
+
+def simulate_flat(dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                  lut: np.ndarray, code: int, fs: np.ndarray) -> np.ndarray:
+    """Exact-model output codes for a uniform field of `code` over phases fs."""
+    lines = np.empty(16, dtype=np.int64)
+    g = int(lut[code, 1])
+    lines.fill(g)
+    hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+    lines.fill(int(lut[code].max()))
+    hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+    lines.fill(hout)
+    return mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs,
+                              np.full(len(fs), hctrl, dtype=np.int64))
+
+
+def rmse_exact(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+               lut: np.ndarray, codes: np.ndarray | None = None) -> float:
+    """End-to-end RMSE (output codes) vs the reference, mask off, exact model."""
+    if codes is None:
+        codes = np.arange(8, 256, 4)
+    fs = np.arange(0, 33) / 64.0
+    errs = []
+    for code in codes:
+        sim = simulate_flat(dark, bright, h, lut, int(code), fs)
+        tgt = np.array([255.0 * _ref_vertical(ref, f, code / 255.0) for f in fs])
+        errs.append(sim - tgt)
+    e = np.concatenate(errs)
+    return float(np.sqrt(np.mean(e * e)))
+
+
+def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                      lut: np.ndarray, tokens: list[list[str]],
+                      mask_encoded: np.ndarray,
+                      codes: np.ndarray | None = None,
+                      align: bool = True) -> tuple[float, float]:
+    """End-to-end RMSE THROUGH the mask: the only honest whole-pipeline metric.
+
+    Mask-off RMSE silently assumes the port's mask equals the shader's mask, so
+    it cannot see two real effects:
+      * clamp ORDER — the shader clips clamp(B*m) (after the mask), MiSTer
+        clamps the V stage and then saturates in the mask. Off-channels at
+        white differ by tens of codes.
+      * gain-split — when gain lives in the mask (G), a mask-off measurement is
+        G times dark by construction and rises with G, which is backwards.
+    Target: 255 * min(B(f,x) * m_encoded, 1) per mask pixel and channel, where
+    B is the pre-clip beam.
+
+    align=True scores every rigid roll of the reference tile and keeps the best.
+    A mask tile shifted by a few output pixels is the SAME mask to the eye (the
+    pattern has no anchor the viewer can see), so a fixed-phase comparison would
+    reject a perfect port purely for starting on a different phosphor stripe.
+
+    Returns (rmse, max_abs_err) in output codes.
+    """
+    import fileio
+    if codes is None:
+        codes = np.arange(8, 256, 4)
+    fs = np.arange(0, 33) / 64.0
+    h_tile, w_tile, _ = mask_encoded.shape
+    mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)   # (h, w, 3)
+    lines = np.empty(16, dtype=np.int64)
+
+    sims, bs = [], []
+    for code in codes:
+        x = int(code) / 255.0
+        ctrl_in = int(lut[int(code)].max())
+        lines.fill(ctrl_in)
+        hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+        ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+        per_ch = []
+        for c in range(3):
+            g = int(lut[int(code), c])
+            lines.fill(g)
+            hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+            lines.fill(hout)
+            per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
+        v = np.stack(per_ch, axis=1)                             # (F, 3)
+        sims.append(np.stack([[mm.mask_multiply(v, m16[yy, xx][None, :])
+                               for xx in range(m16.shape[1])]
+                              for yy in range(m16.shape[0])]))    # (my, mx, F, 3)
+        bs.append(np.array([_ref_vertical_unclipped(ref, f, x) for f in fs]))
+
+    rolls = ([(dy, dx) for dy in range(h_tile) for dx in range(w_tile)]
+             if align else [(0, 0)])
+    best = (np.inf, np.inf)
+    for dy, dx in rolls:
+        ref_tile = np.roll(mask_encoded, (dy, dx), axis=(0, 1))
+        errs = []
+        for sim, b in zip(sims, bs):
+            for yy in range(sim.shape[0]):
+                for xx in range(sim.shape[1]):
+                    tgt = 255.0 * np.minimum(
+                        b[:, None] * ref_tile[yy % h_tile, xx % w_tile][None, :], 1.0)
+                    errs.append(sim[yy, xx] - tgt)
+        e = np.concatenate([a.ravel() for a in errs])
+        cand = (float(np.sqrt(np.mean(e * e))), float(np.abs(e).max()))
+        if cand[0] < best[0]:
+            best = cand
+    return best
+
+
+def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
+                      bright: np.ndarray, tokens: list[list[str]],
+                      mask_encoded: np.ndarray, radius: int = 6) -> np.ndarray:
+    """Model-in-the-loop LUT refinement for the GAIN-SPLIT path.
+
+    refine_lut_exact minimizes the mask-OFF error, which for a gain-split build
+    is the wrong objective — it drags the LUT back toward carrying the clipped
+    transfer and undoes the split. This variant scores each candidate LUT entry
+    through the mask against 255*min(B*m, 1), the same target rmse_exact_masked
+    uses, so refinement and evaluation agree.
+    """
+    import fileio
+    fs = np.arange(0, 33) / 64.0
+    h_tile, w_tile, _ = mask_encoded.shape
+    mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    cells = [(m16[yy, xx], mask_encoded[yy % h_tile, xx % w_tile])
+             for yy in range(m16.shape[0]) for xx in range(m16.shape[1])]
+    lines = np.empty(16, dtype=np.int64)
+    out = lut.copy()
+    for code in range(256):
+        x = code / 255.0
+        b = np.array([_ref_vertical_unclipped(ref, f, x) for f in fs])
+        targets = [255.0 * np.minimum(b[:, None] * enc[None, :], 1.0)
+                   for _, enc in cells]
+        base = lut[code].astype(np.int64)
+        best, best_err = base, np.inf
+        for delta in range(-radius, radius + 1):
+            cand = np.clip(base + delta, 0, 255)
+            lines.fill(int(cand.max()))
+            hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+            ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+            per_ch = []
+            for c in range(3):
+                lines.fill(int(cand[c]))
+                hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+                lines.fill(hout)
+                per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
+            v = np.stack(per_ch, axis=1)
+            err = 0.0
+            for (mult, _), tgt in zip(cells, targets):
+                err += float(((mm.mask_multiply(v, mult[None, :]) - tgt) ** 2).sum())
+            if err < best_err:
+                best, best_err = cand, err
+        out[code] = best
+    for ch in range(3):
+        out[:, ch] = np.maximum.accumulate(out[:, ch])
+    return out
+
+
+def refine_lut_exact(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
+                     bright: np.ndarray, radius: int = 6) -> np.ndarray:
+    """Model-in-the-loop LUT refinement against the EXACT hardware arithmetic.
+
+    optimize_lut works in ideal arithmetic, but MiSTer's FIR truncates: a
+    unity-DC row returns g-1 (or worse where a fitted row sum lands below
+    256), so every simulated level sits 1-4 codes under its ideal value.
+    Rather than model that bias analytically, search it out: each input code's
+    LUT entry affects only that code's outputs, so the problem is separable —
+    for each code, simulate the whole phase grid through mister_model at
+    candidate LUT values and keep the best. Monotonicity is restored after.
+
+    Costs a few seconds per shader and removes the bias at its source (the
+    control value shifts too, which the exact simulation accounts for).
+    """
+    fs = np.arange(0, 33) / 64.0
+    pos = 8.0 + fs
+    lines = np.empty(16, dtype=np.int64)
+    out = lut.copy()
+    for c in range(256):
+        x = c / 255.0
+        target = np.array([255.0 * _ref_vertical(ref, f, x) for f in fs])
+        base = lut[c].astype(np.int64)
+        best, best_err = base, np.inf
+        for delta in range(-radius, radius + 1):
+            cand = np.clip(base + delta, 0, 255)
+            g = int(cand[1])                       # green carries the compared level
+            ctrl_in = int(cand.max())              # adaptive control = max RGB
+            lines.fill(g)
+            hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+            lines.fill(ctrl_in)
+            hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+            lines.fill(hout)
+            sim = mm.fir_1d_adaptive(lines, dark, bright, pos,
+                                     np.full(len(fs), hctrl, dtype=np.int64))
+            err = float(((sim - target) ** 2).sum())
+            if err < best_err:
+                best, best_err = cand, err
+        out[c] = best
+    for ch in range(3):
+        out[:, ch] = np.maximum.accumulate(out[:, ch])
+    return out
+
+
+def mask_encoded_tile(ref) -> np.ndarray:
+    """(h, w, 3) ENCODED per-channel mask multipliers as rendered at 1080p.
+
+    Reference modules describe their mask differently (some publish encoded
+    multipliers directly, some linear ones, some an amplified 0..255 tile), so
+    normalize here rather than in every caller. Linear multipliers are
+    converted with the shader's own output exponent where it publishes one —
+    a mask applied in linear light before an encode of gamma g scales the
+    encoded value by m**(1/g).
+    """
+    spec = ref.mask_spec()
+    for key in ("encoded_equivalent_multipliers", "tile_encoded_multiplier"):
+        if key in spec:
+            tile = np.array(spec[key], dtype=np.float64)
+            return tile[None, :, :] if tile.ndim == 2 else tile
+    gamma = _output_gamma(ref)
+    if "tile_rgb_0_255" in spec:                      # royale family
+        rgb = np.array(spec["tile_rgb_0_255"], dtype=np.float64) / 255.0
+        lin = np.clip(rgb * float(spec.get("mask_amplify", 1.0)), 0.0, None)
+        return lin ** (1.0 / gamma)
+    for key in ("linear_multipliers", "tile_linear_multiplier"):
+        if key in spec:
+            lin = np.array(spec[key], dtype=np.float64)
+            if lin.ndim == 2:
+                lin = lin[None, :, :]
+            return np.clip(lin, 0.0, None) ** (1.0 / gamma)
+    raise KeyError(f"mask_spec() has no recognized multiplier key: {sorted(spec)}")
+
+
+def _output_gamma(ref) -> float:
+    """The exponent the shader encodes its output with.
+
+    A linear-light mask multiplier m scales the ENCODED value by m**(1/gamma),
+    so this must be the shader's own output gamma — hardcoding 2.2 silently
+    mis-scales any shader that encodes differently (Kurozumi's lcd_gamma is
+    2.4: assuming 2.2 puts its red +2.4% and blue -4.9% off target).
+    """
+    try:
+        d = ref.defaults()
+    except Exception:
+        d = {}
+    for key in ("lcd_gamma", "gamma_out", "GAMMA_OUTPUT", "output_gamma"):
+        if key in d and d[key]:
+            return float(d[key])
+    g = getattr(ref, "GAMMA_OUTPUT", None) or getattr(ref, "LCD_GAMMA", None)
+    return float(g) if g else 2.2
+
+
+def fit_gain_split(ref, mask_encoded: np.ndarray,
+                   g_min: float = 1.0, g_max: float = 2.0) -> list[dict]:
+    """Enumerate (mask token grid, gain G) candidates for the gain-split path.
+
+    WHY: the gamma LUT is both the tone curve and the adaptive control. When a
+    shader's beam-centre transfer clips before x=1, LUT pins at 255 over that
+    band, the control pins with it, and every input there gets identical V rows
+    while the true trough still varies — information destroyed before the V
+    stage. Escape: scale the mask by G and have the LUT carry B(x)/G, which
+    keeps rising (injective) as long as B(x)/G <= 1. Saturation then happens at
+    the mask stage, which is also where the shader clips (clamp(B*m)), so the
+    clamp ORDER matches too.
+
+    Feasibility: a v2 token gives its selected channels (16+Y)/16 (<= 1.9375)
+    and the others Z/16 (<= 0.9375), so G is bounded by the *dark* multipliers
+    far more than the lit ones. Where G cannot reach max B(x), the damaged band
+    shrinks rather than vanishing — still a large win.
+
+    Returns candidates sorted by mask fidelity: dicts with keys
+    tokens, gain, mask_rel_rmse, clip_x (input level where the LUT saturates,
+    1.0 = never).
+    """
+    import fileio
+
+    need = _transfer_unclipped(ref, 1.0)          # G >= this => never saturates
+    out = []
+    seen = set()
+    for g in np.linspace(g_min, min(g_max, 2.0), 401):
+        scaled = mask_encoded * g
+        # Reject outright if any pixel is unrepresentable at this gain: the two
+        # smallest channels in a pixel must fit under the shared 15/16 ceiling.
+        feasible = True
+        for row in scaled.reshape(-1, 3):
+            if np.sort(row)[1] > 0.9375 + 0.03 or row.max() > 1.9375 + 0.06:
+                feasible = False
+                break
+        if not feasible:
+            continue
+        tokens, _ = tile_from_encoded(scaled)
+        key = tuple(tuple(r) for r in tokens)
+        if key in seen:
+            continue
+        seen.add(key)
+        h, w, _ = mask_encoded.shape
+        dec = fileio.MaskFile([], w, h, tokens).multipliers()
+        rel = float(np.sqrt(np.mean((dec / g - mask_encoded) ** 2)))
+        # Where does LUT = 255*B(x)/g saturate?
+        clip_x = 1.0
+        if need > g:
+            xs = np.linspace(0.0, 1.0, 512)
+            over = [x for x in xs if _transfer_unclipped(ref, x) > g]
+            clip_x = float(min(over)) if over else 1.0
+        out.append({"tokens": tokens, "gain": float(g), "mask_rel_rmse": rel,
+                    "clip_x": clip_x})
+    out.sort(key=lambda c: (c["mask_rel_rmse"], -c["clip_x"]))
+    return out
+
+
+def build_lut_gain(ref, gain: float, channels: bool = False) -> np.ndarray:
+    """LUT carrying the PRE-CLIP transfer divided by `gain`.
+
+    Pairs with fit_v_adaptive_gain. Stays strictly increasing (so the adaptive
+    control keeps resolving levels) until B(x)/gain exceeds 1.
+    """
+    xfull = np.arange(256) / 255.0
+    u = np.array([min(_transfer_unclipped(ref, x) / gain, 1.0) for x in xfull])
+    u = np.maximum.accumulate(u)
+    lut = np.zeros((256, 3), dtype=np.int64)
+    for c, name in enumerate("rgb"):
+        if channels:
+            ratio = np.array([_transfer(ref, x, name) / max(_transfer(ref, x), 1e-9)
+                              for x in xfull])
+            vals = 255.0 * np.clip(u * ratio, 0.0, 1.0)
+        else:
+            vals = 255.0 * u
+        lut[:, c] = np.clip(np.round(np.maximum.accumulate(vals)), 0, 255)
+    return lut
+
+
+def fit_v_adaptive_gain(ref, lut: np.ndarray, gain: float,
+                        xs: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Adaptive V endpoints for the gain-split path.
+
+    Target row sum = 256 * B(f,x) / B(0,x) capped at 256 (the peak is carried
+    entirely by the LUT, so rows never need over-unity gain and never clip).
+    """
+    if xs is None:
+        xs = np.arange(8, 256, 4) / 255.0
+    lums = np.array([lut[int(round(x * 255))].max() for x in xs], dtype=np.int64)
+    rows = np.zeros((129, len(xs), 4))
+    for p in range(129):
+        f = p / 256.0
+        d = np.array([f + 1.0, f, 1.0 - f, 2.0 - f])
+        for k, x in enumerate(xs):
+            peak = max(_transfer_unclipped(ref, x), 1e-9)
+            # The LUT saturates once B/gain > 1; above that the peak it can
+            # deliver is 255, so ask the rows for the ratio against what the
+            # LUT actually carries, not against B(0,x).
+            carried = min(peak / gain, 1.0) * gain
+            s = 256.0 * min(_ref_vertical_unclipped(ref, f, x) / carried, 1.0)
+            w = np.array([max(ref.beam_weight(di, x), 0.0) for di in d])
+            if w.sum() < 1e-12:
+                w = np.zeros(4)
+                w[np.argmin(d)] = 1.0
+            rows[p, k] = s * w / w.sum()
+    ta = (256.0 - lums) / 256.0
+    tb = lums / 256.0
+    design = np.stack([ta, tb], axis=1)
+    gram_inv = np.linalg.pinv(design.T @ design)
+    dark_f = np.zeros((PHASES, 4))
+    bright_f = np.zeros((PHASES, 4))
+    for p in range(129):
+        sol = gram_inv @ design.T @ rows[p]
+        dark_f[p] = np.clip(sol[0], 0, 512)
+        bright_f[p] = np.clip(sol[1], 0, 512)
+    for p in range(129, PHASES):
+        dark_f[p] = dark_f[PHASES - p][::-1]
+        bright_f[p] = bright_f[PHASES - p][::-1]
+    tables = []
+    for fl in (dark_f, bright_f):
+        fl = np.clip(fl, 0, None)
+        sums = fl.sum(axis=1)
+        over = sums > 256.0
+        fl[over] *= (256.0 / sums[over])[:, None]
+        target_sums = np.round(fl.sum(axis=1)).astype(np.int64)
+        for p in range(1, 128):
+            target_sums[PHASES - p] = target_sums[p]
+        tables.append(quantize.quantize_symmetric(fl, target_sums))
+    return tables[0], tables[1]
 
 
 # ------------------------------------------------------------------ V filters
@@ -174,7 +575,11 @@ def fit_v_adaptive(ref, lut_ctrl: np.ndarray,
 
 def fit_v_fixed(ref, lut_ctrl: np.ndarray, xs: np.ndarray | None = None,
                 weights: np.ndarray | None = None) -> np.ndarray:
-    """Single-set best-compromise V table (weighted mean of ideal rows over x)."""
+    """Single-set best-compromise V table against a GIVEN LUT.
+
+    Kept for callers that must reuse the adaptive LUT; fit_v_fixed_paired
+    produces a better table by choosing its own LUT.
+    """
     if xs is None:
         xs = np.arange(8, 256, 4) / 255.0
     rows, _ = _tap_targets(ref, lut_ctrl, xs)
@@ -193,6 +598,71 @@ def fit_v_fixed(ref, lut_ctrl: np.ndarray, xs: np.ndarray | None = None,
     for p in range(1, 128):
         target_sums[PHASES - p] = target_sums[p]
     return quantize.quantize_symmetric(fixed_f, target_sums)
+
+
+def fit_v_fixed_paired(ref, channels: bool = False,
+                       iters: int = 24) -> tuple[np.ndarray, np.ndarray]:
+    """Jointly fit a fixed (non-adaptive) V table AND its own gamma LUT.
+
+    Without an adaptive control the flat-field model collapses to
+        out(f, x) = u(x) * S(f) / 256
+    which is exactly a RANK-1 factorization of the target matrix — so the
+    optimum is an alternating least squares on (u, S), not a weighted average
+    of per-x ideal rows (what fit_v_fixed does), and it wants its own LUT
+    rather than one warped for the adaptive path.
+
+    Returns (fixed table, (256, 3) LUT).
+    """
+    xs = np.arange(8, 256, 4) / 255.0
+    fs = np.arange(0, 129) / 256.0
+    O = np.array([[_ref_vertical(ref, f, x) for x in xs] for f in fs])   # (129, NX)
+
+    u = np.array([max(_transfer(ref, x), 1e-6) for x in xs])
+    S = np.full(len(fs), 1.0)
+    for _ in range(iters):
+        denom = float((u * u).sum())
+        S = (O @ u) / max(denom, 1e-12)
+        S = np.clip(S, 0.0, 1.0)                       # row sums <= 256: no clipping
+        denom = float((S * S).sum())
+        u = (O.T @ S) / max(denom, 1e-12)
+        u = np.clip(u, 1e-6, 1.0)
+        u = np.maximum.accumulate(u)                   # LUT must be monotone
+
+    # Tap shapes still come from the beam; only the row sums come from S.
+    fixed_f = np.zeros((PHASES, 4))
+    for p in range(129):
+        f = p / 256.0
+        d = np.array([f + 1.0, f, 1.0 - f, 2.0 - f])
+        w = np.array([max(ref.beam_weight(di, 0.5), 0.0) for di in d])
+        if w.sum() < 1e-12:
+            w = np.zeros(4)
+            w[np.argmin(d)] = 1.0
+        fixed_f[p] = 256.0 * S[p] * w / w.sum()
+    for p in range(129, PHASES):
+        fixed_f[p] = fixed_f[PHASES - p][::-1]
+    fixed_f = np.clip(fixed_f, 0, None)
+    sums = fixed_f.sum(axis=1)
+    over = sums > 256.0
+    fixed_f[over] *= (256.0 / sums[over])[:, None]
+    target_sums = np.round(fixed_f.sum(axis=1)).astype(np.int64)
+    for p in range(1, 128):
+        target_sums[PHASES - p] = target_sums[p]
+    table = quantize.quantize_symmetric(fixed_f, target_sums)
+
+    xfull = np.arange(256) / 255.0
+    ufull = np.maximum.accumulate(np.clip(
+        np.interp(xfull, np.concatenate([[0.0], xs]),
+                  np.concatenate([[_transfer(ref, 0.0)], u])), 0.0, 1.0))
+    lut = np.zeros((256, 3), dtype=np.int64)
+    for c, name in enumerate("rgb"):
+        if channels:
+            ratio = np.array([_transfer(ref, x, name) / max(_transfer(ref, x), 1e-9)
+                              for x in xfull])
+            vals = 255.0 * np.clip(ufull * ratio, 0.0, 1.0)
+        else:
+            vals = 255.0 * ufull
+        lut[:, c] = np.clip(np.round(np.maximum.accumulate(vals)), 0, 255)
+    return table, lut
 
 
 def no_scanline_table(ref, at_x: float = 1.0) -> np.ndarray:
@@ -237,23 +707,182 @@ def fit_h(ref) -> np.ndarray:
 
 # ------------------------------------------------------------------ masks
 
+_RAMP = np.arange(0, 256, 5, dtype=np.int64)
+
+
+def _token_response(m16: np.ndarray) -> np.ndarray:
+    """(len(RAMP), 3) exact output codes for per-channel multipliers m16."""
+    return mm.mask_multiply(np.repeat(_RAMP[:, None], 3, axis=1),
+                            np.asarray(m16, dtype=np.int64)[None, :])
+
+
 def fit_mask_token(target_mult: np.ndarray, weights: np.ndarray = LUMA_W,
-                   y_max: int = 15) -> tuple[str, float]:
+                   y_max: int = 15, exact: bool = True) -> tuple[str, float]:
     """Best v2 token for one output pixel's encoded per-channel multipliers.
 
-    Enumerates channel bitmask 1..7 and nibbles; returns (token, weighted_rmse).
+    exact=True scores through mister_model.mask_multiply over a gray ramp
+    rather than comparing ideal m/16 values. The hardware multiplies by summing
+    INDEPENDENTLY truncated shifts, so nominal error and real error disagree:
+    m=15/16 runs ~1.5 codes low on average (4 truncations) while m=16/16 is
+    exact, which can flip which token wins.
     """
     import fileio
+    tgt = _RAMP[:, None] * np.asarray(target_mult, dtype=np.float64)[None, :]
+    tgt = np.clip(np.round(tgt), 0, 255)
     best = (None, np.inf)
     for bm in range(1, 8):
         sel = np.array([bool(bm & 4), bool(bm & 2), bool(bm & 1)])
         for y in range(0, y_max + 1):
             for z in range(0, 16):
-                m = np.where(sel, (16 + y) / 16.0, z / 16.0)
-                err = float((weights * (m - target_mult) ** 2).sum())
+                m16 = np.where(sel, 16 + y, z)
+                if exact:
+                    resp = _token_response(m16)
+                    err = float((weights * ((resp - tgt) ** 2)).sum() / len(_RAMP))
+                else:
+                    m = m16 / 16.0
+                    err = float((weights * (m - target_mult) ** 2).sum())
                 if err < best[1]:
                     best = (fileio.encode_mask_token(bm, 16 + y, z), err)
     return best[0], float(np.sqrt(best[1]))
+
+
+def fit_mask_column_dither(target_mult: np.ndarray, repeats: int,
+                           weights: np.ndarray = LUMA_W,
+                           shortlist: int = 48) -> tuple[list[str], float]:
+    """Dither one pixel's target across `repeats` horizontal copies.
+
+    A v2 token gives its selected channels one value and BOTH others a single
+    shared value, so a triple like Kurozumi's (1.30, 1.01, 0.57) — green near
+    unity while blue is halved — is unrepresentable in any single token, and a
+    one-token fit must sacrifice a channel (it spends blue, weight 0.07, to buy
+    luma, which is what flattens the R/B ripple).
+
+    Dithering across HORIZONTAL repeats fixes this: the eye integrates the pair
+    and the pattern already repeats horizontally, so the tile gains no vertical
+    structure at all — its vertical spectrum is unchanged, which matters because
+    a 2-row tile would inject a Nyquist luma component that beats against the
+    4.5x scanline (measured up to ~3.6 codes).
+
+    Returns (tokens for each repeat, exact weighted rmse of their mean).
+
+    The pair search is EXHAUSTIVE over all 7*16*16 tokens via a Gram matrix.
+    Shortlisting by solo error is wrong here: the best dither pair is usually
+    two individually-poor tokens that straddle the target (one over, one under)
+    and average onto it, which any solo-error shortlist discards first.
+    """
+    import fileio
+    if repeats == 1:
+        tok, err = fit_mask_token(target_mult, weights)
+        return [tok], err
+
+    tgt = np.clip(np.round(_RAMP[:, None]
+                           * np.asarray(target_mult, dtype=np.float64)[None, :]), 0, 255)
+    names, resp = [], []
+    for bm in range(1, 8):
+        sel = np.array([bool(bm & 4), bool(bm & 2), bool(bm & 1)])
+        for y in range(0, 16):
+            for z in range(0, 16):
+                m16 = np.where(sel, 16 + y, z)
+                names.append(fileio.encode_mask_token(bm, 16 + y, z))
+                resp.append(_token_response(m16).astype(np.float64))
+    R = np.array(resp)                                   # (N, ramp, 3)
+    w = np.sqrt(weights)[None, None, :]
+    Rw = (R * w).reshape(len(names), -1)                 # weighted, flattened
+    Tw = (tgt * w[0]).ravel()
+    # ||(Ri+Rj)/2 - T||^2 = a_i + a_j + <Ri,Rj>/2 + ||T||^2
+    a = 0.25 * (Rw * Rw).sum(axis=1) - Rw @ Tw
+    G = Rw @ Rw.T
+    err = a[:, None] + a[None, :] + 0.5 * G + float(Tw @ Tw)
+    i, j = np.unravel_index(int(np.argmin(err)), err.shape)
+    pair = [names[i], names[j]]
+    toks = (pair * (repeats // 2 + 1))[:repeats]
+    return toks, float(np.sqrt(max(err[i, j], 0.0) / len(_RAMP)))
+
+
+def fit_mask_tile(ref, gain: float = 1.0, max_dim: int = 16,
+                  strategy: dict | None = None) -> tuple[list[list[str]], dict]:
+    """Full mask pipeline: encoded target -> hardware tile -> token grid.
+
+    `strategy` pins the tile choice per shader (a look judgement that wants
+    measurement, not a generic heuristic — see DESIGN.md):
+        period   (ph, pw) hardware tile size to use
+        kind     'mean' (average the repeats) | 'verbatim' (slice)
+        dither   N: spread each column across N horizontal slots
+    Omitted keys fall back to choose_mask_tile / no dither.
+    `gain` scales the target for the gain-split factorization.
+    """
+    strategy = strategy or {}
+    target = mask_encoded_tile(ref) * gain
+    H, W, _ = target.shape
+
+    if "period" in strategy:
+        ph, pw = strategy["period"]
+        kind = strategy.get("kind", "mean")
+        if kind == "verbatim":
+            tile = target[:ph, :pw].copy()
+        else:
+            acc = np.zeros((ph, pw, 3))
+            cnt = np.zeros((ph, pw, 1))
+            for yy in range(H):
+                for xx in range(W):
+                    acc[yy % ph, xx % pw] += target[yy, xx]
+                    cnt[yy % ph, xx % pw, 0] += 1
+            tile = acc / cnt
+        rebuilt = np.tile(tile, (H // ph + 1, W // pw + 1, 1))[:H, :W]
+        info = {"period": (ph, pw), "kind": kind,
+                "spatial_rmse": float(np.sqrt(np.mean((rebuilt - target) ** 2))),
+                "structure_kept": _structure_overlap(rebuilt, target)}
+    else:
+        tile, info = choose_mask_tile(target, max_dim=max_dim)
+    h, w, _ = tile.shape
+
+    tokens, _ = tile_from_encoded(tile)
+    info = dict(info, err_plain=_tile_exact_err(tokens, tile), dithered=False)
+
+    n = int(strategy.get("dither", 1))
+    if n > 1 and w * n <= max_dim:
+        # Partners sit one full period apart (col xx at positions xx, xx+w, ...),
+        # NOT adjacent: the base pattern's own alternation must survive, so the
+        # dither residual lands at a higher frequency (1/(n*w) cyc/px) instead of
+        # replacing the ripple the mask exists to produce.
+        rows = []
+        for yy in range(h):
+            row = [None] * (w * n)
+            for xx in range(w):
+                toks, _ = fit_mask_column_dither(tile[yy, xx], n)
+                for k in range(n):
+                    row[k * w + xx] = toks[k]
+            rows.append(row)
+        info.update(dithered=True,
+                    err_dither=_tile_exact_err(rows, tile, group=w))
+        return rows, info
+    return tokens, info
+
+
+def _tile_exact_err(tokens: list[list[str]], target: np.ndarray,
+                    group: int | None = None) -> float:
+    """Exact-arithmetic luma-weighted RMSE (output codes) of a token grid.
+
+    `group`: when the grid dithers, columns xx, xx+group, xx+2*group... are the
+    repeats of ONE target column and it is their MEAN that must match it —
+    scoring each token against the target alone would condemn every dither.
+    """
+    import fileio
+    mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    h, w, _ = target.shape
+    cols = m16.shape[1]
+    group = group or cols
+    errs = []
+    for yy in range(m16.shape[0]):
+        for xx in range(group):
+            reps = [_token_response(m16[yy, k]).astype(np.float64)
+                    for k in range(xx, cols, group)]
+            resp = np.mean(reps, axis=0)
+            tgt = np.clip(np.round(_RAMP[:, None]
+                                   * target[yy % h, xx % w][None, :]), 0, 255)
+            errs.append(LUMA_W * (resp - tgt) ** 2)
+    return float(np.sqrt(np.mean(np.sum(np.array(errs), axis=2))))
 
 
 def tile_from_encoded(mult_encoded: np.ndarray) -> tuple[list[list[str]], float]:
@@ -268,6 +897,68 @@ def tile_from_encoded(mult_encoded: np.ndarray) -> tuple[list[list[str]], float]
             errs.append(e)
         tokens.append(row)
     return tokens, float(np.sqrt(np.mean(np.square(errs))))
+
+
+def _structure_spectrum(tile: np.ndarray) -> np.ndarray:
+    """Per-channel 2-D magnitude spectrum with DC removed (structure only)."""
+    s = np.abs(np.fft.fft2(tile, axes=(0, 1)))
+    s[0, 0, :] = 0.0
+    return s
+
+
+def _structure_overlap(cand_tiled: np.ndarray, target: np.ndarray) -> float:
+    """Fraction of the target's structure the candidate keeps AT THE RIGHT
+    frequencies: sum_f min(|C(f)|, |T(f)|) / sum_f |T(f)|.
+
+    Comparing total spectral energy is not enough — a tile can hold the same
+    energy at the WRONG frequencies and score 100%. Per-frequency overlap
+    cannot be gamed that way, and it punishes exactly the failure that matters:
+    a band present in the target and zeroed in the candidate contributes 0.
+    """
+    c = _structure_spectrum(cand_tiled)
+    t = _structure_spectrum(target)
+    denom = float(t.sum())
+    return float(np.minimum(c, t).sum() / denom) if denom > 1e-12 else 1.0
+
+
+def choose_mask_tile(tile: np.ndarray, max_dim: int = 16,
+                     structure_weight: float = 3.0) -> tuple[np.ndarray, dict]:
+    """Pick the hardware mask tile (<= max_dim) that best represents `tile`.
+
+    Mean-averaging the repeats is the L2-optimal period tile, which is exactly
+    why picking by per-pixel RMSE is a trap: when a component is ANTISYMMETRIC
+    under the chosen period, the mean cancels it to zero and the RMSE *improves*
+    for having destroyed it. Royale's 24x24 slot tile is antisymmetric under
+    y -> y+12, so a 12-row mean silently degrades a slot mask into a plain
+    aperture grille (its whole point) while scoring better.
+
+    So score candidates on spatial error PLUS how well they preserve the
+    source's non-DC spectrum, and offer verbatim slices alongside means.
+    Returns (tile, info).
+    """
+    H, W, _ = tile.shape
+    tgt_spec = _structure_spectrum(tile)
+    tgt_energy = float(np.sqrt((tgt_spec ** 2).sum()))
+    best = (None, np.inf, None)
+    for ph in [d for d in range(1, min(H, max_dim) + 1) if H % d == 0]:
+        for pw in [d for d in range(1, min(W, max_dim) + 1) if W % d == 0]:
+            acc = np.zeros((ph, pw, 3))
+            cnt = np.zeros((ph, pw, 1))
+            for yy in range(H):
+                for xx in range(W):
+                    acc[yy % ph, xx % pw] += tile[yy, xx]
+                    cnt[yy % ph, xx % pw, 0] += 1
+            variants = {"mean": acc / cnt, "verbatim": tile[:ph, :pw].copy()}
+            for kind, cand in variants.items():
+                rebuilt = np.tile(cand, (H // ph + 1, W // pw + 1, 1))[:H, :W]
+                spatial = float(np.sqrt(np.mean((rebuilt - tile) ** 2)))
+                kept = _structure_overlap(rebuilt, tile)
+                score = spatial + structure_weight * (1.0 - kept) + 1e-4 * (ph * pw)
+                if score < best[1]:
+                    best = (cand, score, {"period": (ph, pw), "kind": kind,
+                                          "spatial_rmse": spatial,
+                                          "structure_kept": kept})
+    return best[0], best[2]
 
 
 def minimal_period_tile(tile: np.ndarray, max_dim: int = 16) -> tuple[np.ndarray, float]:

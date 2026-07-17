@@ -274,6 +274,64 @@ Deep scanlines at fractional scales: 224-line cores at 1080p show a faint
 line-thickness ripple (within the pack's moire guard); vscale_mode=1
 removes it entirely and is recommended for this preset.
 
+V5.1 REVISIONS (2026-07-17)
+---------------------------
+A second pass re-examined every shader in the pack against a corrected
+acceptance metric (port pixels vs shader pixels THROUGH the mask - the
+previous mask-off measurement could not see clamp-order error). Results:
+
+  CRT Easymode v5 - Default        NEW. See below.
+  CRT Royale                       Mask rebuilt: the previous tile had lost
+                                   the slot structure entirely (see below).
+  CRT Royale Kurozumi              Mask rebuilt: 4.7x more accurate, phosphor
+                                   ripple restored to full strength.
+  CRT Guest Advanced               Filters refined; mask confirmed optimal.
+  CRT Lottes                       Deliberately unchanged - measured and found
+                                   already within 2% of the best achievable.
+
+CRT EASYMODE V5 - why it exists
+-------------------------------
+The v4 Easymode presets are kept for comparison, but "CRT Easymode v5 -
+Default" replaces them for normal use. It is measurably closer to the shader
+(3.2 vs 5.0 codes), never clips in the scaler (v4's filters ran 8% over unity
+and flattened highlights), and degrades far better on cores without adaptive
+filter support (21 vs 30 codes).
+
+The change that mattered: Easymode's BRIGHT_BOOST clips the scanline peak from
+75% white upward. The v4 factorization put the whole tone curve in the gamma
+LUT, which pins at maximum across that band - and because MiSTer's adaptive
+filter is steered by the LUT's own output, the scanline depth control pinned
+with it, so the top 15% of the picture rendered with one frozen scanline
+profile. v5 divides the LUT by 1.105 and puts that gain in the mask, so the
+control keeps working and saturation happens at the mask stage, which is
+exactly where the shader clips too.
+
+If the v4 Easymode presets looked dim on your machine, also check whether your
+core supports adaptive filters (see COMPATIBILITY) - v4's Adaptive preset
+degrades badly there, and that is the single most likely cause.
+
+CRT ROYALE - mask correction
+----------------------------
+The v5.0 Royale mask was derived by averaging the shader's 24x24 slot tile down
+to a hardware-legal size. That tile is antisymmetric top-to-bottom, so the
+averaging cancelled the slot modulation exactly: the shipped mask was a plain
+aperture grille with none of the slot structure that is the point of Royale's
+mask. Worse, the error metric rewarded it for that. v5.1 ships a verbatim slice
+of the real tile instead, keeping the slot signal. Its vertical rhythm repeats
+every 12 output pixels rather than 24 - a visible-structure trade worth an A/B
+if you have a preference.
+
+CRT ROYALE KUROZUMI - mask correction
+-------------------------------------
+Two fixes. The mask multipliers were being converted with the wrong exponent
+(2.2; Kurozumi encodes at 2.4), putting red 2.4% high and blue 4.9% low. And
+Kurozumi's grille needs per-pixel multipliers that no single mask token can
+express - one token gives both non-selected channels the same value, while the
+target needs green near full and blue near half. The fit had been sacrificing
+the blue ripple. It is now dithered across two horizontal positions, which the
+eye integrates: 4.7x more accurate, full ripple, and no vertical patterning
+(a vertical dither would have beaten against the scanlines).
+
 COMPATIBILITY (applies to all three)
 ------------------------------------
 On cores built without adaptive filter support, adaptive files silently run

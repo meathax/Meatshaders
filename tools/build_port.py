@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fileio
 import fitting
 import mister_model as mm
+from fitting import rmse_exact
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = (r"C:\Users\meath\AppData\Local\Temp\claude\D--Arcade-AI-shaders"
@@ -34,7 +35,10 @@ SHADERS = {
         "preset_base": "CRT Guest Advanced",
         "shader_name": "crt-guest-advanced (guest.r)",
         "lut_channels": False,
-        "mask_style": "encoded_tile",
+        # transfer() never clips -> no headroom to split; 50e/20e mask is the
+        # exact optimum under every weighting tested.
+        "gain": None,
+        "mask_strategy": None,
     },
     "royale": {
         "module": "royale_ref",
@@ -42,7 +46,11 @@ SHADERS = {
         "preset_base": "CRT Royale",
         "shader_name": "crt-royale (TroggleMonkey)",
         "lut_channels": False,
-        "mask_style": "rgb_amplify_tile",
+        "gain": None,
+        # The 24x24 slot tile is antisymmetric under y -> y+12, so averaging the
+        # repeats cancels the slot modulation outright and leaves an aperture
+        # grille. Take a verbatim slice instead and keep the slot.
+        "mask_strategy": {"period": (12, 6), "kind": "verbatim"},
     },
     "kurozumi": {
         "module": "kurozumi_ref",
@@ -50,8 +58,26 @@ SHADERS = {
         "preset_base": "CRT Royale Kurozumi",
         "shader_name": "crt-royale-kurozumi (P22/PVM preset over crt-royale)",
         "lut_channels": True,
-        "mask_style": "rgb_amplify_tile",
+        "gain": None,
+        # (1.30, 1.01, 0.57) is unrepresentable in one v2 token (green near
+        # unity while blue is halved, and the two share a nibble). Dither the
+        # pair horizontally: exact-arithmetic error 11.6 -> 3.0 codes with the
+        # R/B ripple restored to full amplitude and no vertical structure added.
+        "mask_strategy": {"period": (1, 2), "dither": 2},
         "moire_soften_candidates": [0.05, 0.08, 0.12, 0.16, 0.22],
+    },
+    "easymode": {
+        "module": "easymode_ref",
+        "file_base": "CRT Easymode v5 (Port)",
+        "preset_base": "CRT Easymode v5",
+        "shader_name": "crt-easymode (Easymode, GPL)",
+        "lut_channels": False,
+        # BRIGHT_BOOST=1.2 clips the beam centre from x=0.849, which would pin
+        # the LUT (and with it the adaptive control) over the top 15% of the
+        # range. Carry B(x)/1.105 in the LUT and the gain in the mask instead:
+        # saturation moves to the mask stage, where the shader also clips.
+        "gain": 1.105,
+        "mask_strategy": None,
     },
 }
 
@@ -92,22 +118,6 @@ def v_moire(dark, bright, lut, xs=(0.25, 0.5, 0.75, 1.0)) -> float:
     return worst
 
 
-def mask_encoded_tile(ref, style: str) -> np.ndarray:
-    spec = ref.mask_spec()
-    if style == "encoded_tile":
-        enc = spec.get("encoded_equivalent_multipliers")
-        if enc is None:
-            lin = np.array(spec["linear_multipliers"], dtype=np.float64)
-            enc = lin ** (1.0 / 2.2)
-        tile = np.array(enc, dtype=np.float64)
-        if tile.ndim == 2:                       # (w, 3) row -> (1, w, 3)
-            tile = tile[None, :, :]
-        return tile
-    rgb = np.array(spec["tile_rgb_0_255"], dtype=np.float64) / 255.0
-    lin = rgb * float(spec["mask_amplify"])
-    return np.clip(lin, 0.0, None) ** (1.0 / 2.2)
-
-
 def build(key: str) -> None:
     cfg = SHADERS[key]
     ref = __import__(cfg["module"])
@@ -115,18 +125,65 @@ def build(key: str) -> None:
     provenance = f"{cfg['shader_name']}; libretro/slang-shaders @ {COMMIT[:12]}"
     made = []
 
-    # ---- gamma -------------------------------------------------------------
-    lut = fitting.optimize_lut(ref, channels=cfg["lut_channels"])
+    # ---- H filter (needed early: the exact refinement simulates through it) --
+    h = fitting.fit_h(ref)
+    gain = cfg.get("gain")
+
+    # ---- mask ---------------------------------------------------------------
+    m_target = fitting.mask_encoded_tile(ref)
+    tokens, minfo = fitting.fit_mask_tile(ref, gain=gain or 1.0,
+                                          strategy=cfg.get("mask_strategy"))
+    print(f"[{key}] mask: source {m_target.shape[0]}x{m_target.shape[1]} -> "
+          f"{len(tokens)}x{len(tokens[0])} ({minfo['kind']}, "
+          f"structure {minfo['structure_kept'] * 100:.0f}%, "
+          f"dither={minfo['dithered']}), exact err "
+          f"{minfo.get('err_dither', minfo['err_plain']):.2f} codes")
+
+    # ---- gamma + V, alternately refined against the exact hardware model -----
+    if gain:
+        lut = fitting.build_lut_gain(ref, gain, channels=cfg["lut_channels"])
+        dark, bright = fitting.fit_v_adaptive_gain(ref, lut, gain)
+        for it in range(3):
+            lut = fitting.refine_lut_masked(ref, lut, h, dark, bright, tokens, m_target)
+            dark, bright = fitting.fit_v_adaptive_gain(ref, lut, gain)
+            r, _ = fitting.rmse_exact_masked(ref, dark, bright, h, lut, tokens, m_target)
+            print(f"[{key}] refine pass {it + 1}: masked RMSE {r:.3f} codes")
+    else:
+        lut = fitting.optimize_lut(ref, channels=cfg["lut_channels"])
+        dark, bright = fitting.fit_v_adaptive(ref, lut.max(axis=1))
+        for it in range(3):
+            lut = fitting.refine_lut_exact(ref, lut, h, dark, bright)
+            dark, bright = fitting.fit_v_adaptive(ref, lut.max(axis=1))
+            print(f"[{key}] refine pass {it + 1}: RMSE "
+                  f"{rmse_exact(ref, dark, bright, h, lut):.3f} codes (mask off)")
+
+    gain_note = (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
+                 f"the mask carries {gain:.3f}" if gain else
+                 "LUT carries the beam-centre transfer")
     gpath = os.path.join(ROOT, "Gamma", f"{fb}.txt")
     fileio.write_gamma(gpath, lut, header=[
-        f"Name: {fb}", provenance,
-        "Warped beam-center transfer, co-optimized with the adaptive V fit;",
-        "pair with the matching (Port) filters"])
+        f"Name: {fb}", provenance, gain_note,
+        "Co-optimized with the adaptive V fit and refined against MiSTer's",
+        "exact truncating arithmetic; pair with the matching (Port) files"])
     made.append(gpath)
     lut_ctrl = lut.max(axis=1)                    # adaptive control = max RGB
 
+    mname = f"{fb}.txt"
+    mpath = os.path.join(ROOT, "Shadow_Masks", mname)
+    fileio.write_mask(mpath, fileio.MaskFile(
+        [f"Name: {fb}", provenance,
+         f"Shader mask as rendered at 1080p, fitted in encoded space with"
+         f" MiSTer's exact mask arithmetic",
+         (f"Carries the {gain:.3f} gain-split factor - use ONLY with the"
+          f" matching (Port) gamma" if gain else
+          "Pair with the matching (Port) gamma and V filters"),
+         (f"Horizontally dithered: each column's target needs two tokens"
+          if minfo["dithered"] else
+          f"Tile kind: {minfo['kind']}")],
+        len(tokens[0]), len(tokens), tokens))
+    made.append(mpath)
+
     # ---- V filters ----------------------------------------------------------
-    dark, bright = fitting.fit_v_adaptive(ref, lut_ctrl)
     moire = v_moire(dark, bright, lut)
     print(f"[{key}] adaptive V moire (worst trough-std): {moire:.2f} codes "
           f"(limit {MOIRE_LIMIT:.2f})")
@@ -142,13 +199,27 @@ def build(key: str) -> None:
                       "Secondary coefficients (maximum RGB = 255)"])
     made.append(vpath)
 
-    fixed = fitting.fit_v_fixed(ref, lut_ctrl)
+    # Fixed fallback gets its own jointly-fitted LUT: without an adaptive
+    # control the model is rank-1 and its optimal warp differs from the
+    # adaptive one (sharing the adaptive LUT costs several codes of RMSE).
+    fixed, fixed_lut = fitting.fit_v_fixed_paired(ref, channels=cfg["lut_channels"])
+    for _ in range(2):
+        fixed_lut = fitting.refine_lut_exact(ref, fixed_lut, h, fixed, fixed)
+    print(f"[{key}] fixed fallback: RMSE {rmse_exact(ref, fixed, fixed, h, fixed_lut):.3f} "
+          f"codes (own LUT)")
     fpath = os.path.join(ROOT, "Filters", f"{fb}_V Fixed.txt")
     fileio.write_filter(fpath, fileio.FilterFile(
         [f"Name: {fb}_V Fixed"] + header_common +
-        ["Best single-profile compromise for non-adaptive (v6) cores"],
+        ["Best single-profile compromise for non-adaptive (v6) cores",
+         f"Pair with Gamma/{fb} Fixed.txt (NOT the adaptive gamma)"],
         False, True, [fixed]))
     made.append(fpath)
+    fgpath = os.path.join(ROOT, "Gamma", f"{fb} Fixed.txt")
+    fileio.write_gamma(fgpath, fixed_lut, header=[
+        f"Name: {fb} Fixed", provenance,
+        "Rank-1 transfer fitted jointly with the fixed (non-adaptive) V table;",
+        "use only with the matching _V Fixed filter"])
+    made.append(fgpath)
 
     nos = fitting.no_scanline_table(ref)
     npath = os.path.join(ROOT, "Filters", f"{fb}_V No Scanlines.txt")
@@ -180,28 +251,10 @@ def build(key: str) -> None:
                 break
 
     # ---- H filter ------------------------------------------------------------
-    h = fitting.fit_h(ref)
     hpath = os.path.join(ROOT, "Filters", f"{fb}_H.txt")
     fileio.write_filter(hpath, fileio.FilterFile(
         [f"Name: {fb}_H"] + header_common, False, True, [h]))
     made.append(hpath)
-
-    # ---- mask ------------------------------------------------------------------
-    enc_tile = mask_encoded_tile(ref, cfg["mask_style"])
-    tile, period_err = fitting.minimal_period_tile(enc_tile)
-    tokens, tok_err = fitting.tile_from_encoded(tile)
-    print(f"[{key}] mask: {enc_tile.shape[0]}x{enc_tile.shape[1]} -> "
-          f"{len(tokens)}x{len(tokens[0])} tile, period rmse {period_err:.4f}, "
-          f"token rmse {tok_err:.4f} (multiplier units)")
-    mname = f"{fb}.txt"
-    mpath = os.path.join(ROOT, "Shadow_Masks", mname)
-    fileio.write_mask(mpath, fileio.MaskFile(
-        [f"Name: {fb}", provenance,
-         f"Encoded-space fit of the shader mask as rendered at 1080p "
-         f"(token rmse {tok_err:.3f})",
-         "Pair with the matching (Port) gamma and V filters"],
-        len(tokens[0]), len(tokens), tokens))
-    made.append(mpath)
 
     # ---- presets ------------------------------------------------------------------
     def preset(name: str, entries: dict[str, str]) -> None:
@@ -219,7 +272,8 @@ def build(key: str) -> None:
         "maskmode": "1x",
     }
     preset("Default", base)
-    preset("Fixed Compatibility", {**base, "vfilter": f"{fb}_V Fixed.txt"})
+    preset("Fixed Compatibility", {**base, "vfilter": f"{fb}_V Fixed.txt",
+                                   "gamma": f"{fb} Fixed.txt"})
     preset("No Gamma", {**base, "gamma": "off"})
     preset("TATE", {**base,
                     "hfilter": f"{fb}_V Adaptive.txt",

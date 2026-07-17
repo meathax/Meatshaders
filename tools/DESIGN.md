@@ -80,6 +80,74 @@ Files: `CRT Guest Advanced (Port)_H.txt`, `..._V Adaptive.txt`, `..._V Fixed.txt
 No collisions with the existing v4 pack or the official MiSTer repos
 (prior-art scan found no existing ports of these shaders).
 
+## v5.1 revisions (2026-07-17, second pass)
+
+Five changes, each driven by a measurement that contradicted an assumption above.
+
+1. **The acceptance metric was wrong.** Mask-off RMSE silently assumes the
+   port's mask equals the shader's, so it cannot see clamp-ORDER error (the
+   shader clips `clamp(B*m)` after the mask; MiSTer clamps the V stage then
+   saturates in the mask) and it is actively backwards for a gain-split build.
+   `rmse_exact_masked` compares port pixels against shader pixels through the
+   mask and is now the gate. It is roll-invariant: a mask tile shifted a few
+   output pixels is the same mask to the eye.
+
+2. **Gain-split factorization** (`fit_gain_split` / `build_lut_gain` /
+   `fit_v_adaptive_gain`). The LUT is both the tone curve *and* the adaptive
+   control, so wherever `transfer()` clips, the LUT pins at 255, the control
+   pins with it, and every input in that band gets identical V rows while the
+   real trough still varies — information destroyed before the V stage. Fix:
+   the LUT carries the PRE-clip beam `B(x)/G` (strictly increasing, so the
+   control keeps resolving) and the mask carries `G`. Saturation then happens
+   at the mask stage, which is where the shader clips too. `G` is bounded by
+   the *dark* mask multipliers (shared `Z/16 <= 0.9375` nibble), not the lit
+   ones. Requires `ref.transfer_unclipped` / `ref.ref_vertical_unclipped`.
+   Easymode: G=1.105 → 3.16 codes vs 8.37 baseline and 4.97 for v4.
+   This is what v4's Lottes 47e mask was doing empirically; it now falls out
+   of the math (the search re-derives 42f for Easymode and the 47e family for
+   Lottes unprompted).
+
+3. **Model-in-the-loop LUT refinement** (`refine_lut_exact`, and
+   `refine_lut_masked` for the gain-split path — using the mask-off variant on
+   a gain-split build undoes the split). MiSTer's FIR truncates, so a unity-DC
+   row returns g-1: every level sat 1–4 codes under its ideal value because the
+   fit ran in ideal arithmetic. Each code's LUT entry only affects that code, so
+   the search is separable and cheap.
+
+4. **Fixed fallback gets its own LUT** (`fit_v_fixed_paired`). Without an
+   adaptive control the model collapses to `out = u(x)*S(f)/256` — a rank-1
+   factorization whose optimal warp differs from the adaptive one. Alternating
+   least squares on (u, S) instead of averaging per-x ideal rows: Guest 8.7→4.5,
+   Royale 38.2→23.2, Kurozumi 26.4→17.5.
+
+5. **Mask pipeline** — three real defects:
+   - `minimal_period_tile` averaged the repeats, which is L2-optimal and
+     therefore a trap: a component ANTISYMMETRIC under the chosen period is
+     cancelled to zero and the RMSE *improves* for destroying it. Royale's
+     24x24 slot tile is antisymmetric under y→y+12, so the shipped 12x3 mean
+     was a plain aperture grille with **0% of the slot signal**. Now
+     `choose_mask_tile` scores per-frequency spectral overlap and offers
+     verbatim slices (Royale ships a 12x6 verbatim slice).
+   - The encode exponent was hardcoded to 2.2; Kurozumi's `lcd_gamma` is 2.4
+     (`_output_gamma` reads it from the reference).
+   - A v2 token gives its two non-selected channels ONE shared value, so
+     Kurozumi's (1.30, 1.01, 0.57) is unrepresentable and a single-token fit
+     spends blue to buy luma, flattening the R/B ripple. `fit_mask_column_dither`
+     spreads it across two HORIZONTAL slots (exhaustive pair search via a Gram
+     matrix — shortlisting by solo error discards exactly the straddling pairs
+     that dither well). Partners sit one period apart so the base alternation
+     survives and the residual moves to a higher frequency; horizontal dithering
+     adds no vertical structure, unlike a 2-row tile which would beat against
+     the 4.5x scanline. Exact error 11.6 → 3.0 codes.
+   Token scoring now runs through `mister_model.mask_multiply` (per-set-bit
+   truncated shifts) rather than ideal m/16 — m=15/16 runs ~1.5 codes low while
+   m=16/16 is exact, which flips winners.
+
+**Lottes is deliberately NOT rebuilt.** Measured on the same metric, the shipped
+v4 scores 1.233 against a best-achievable 1.208 — a 2% difference on the user's
+gold standard. v4's gamma=off + gain-in-mask factorization already mirrors the
+shader's clamp order. Verified, left alone.
+
 ## Validation gates (task 8)
 
 - fileio validators pass on every generated file; presets resolve case-sensitively.

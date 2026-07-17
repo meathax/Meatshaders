@@ -1,20 +1,21 @@
 ####
 # Name: CRT Royale (Port)
 # crt-royale (TroggleMonkey); libretro/slang-shaders @ 3b0d6aa1d134
-# Encoded-space fit of the shader mask as rendered at 1080p (token rmse 0.067)
+# Shader mask as rendered at 1080p, fitted in encoded space with MiSTer's exact mask arithmetic
 # Pair with the matching (Port) gamma and V filters
+# Tile kind: verbatim
 ####
 v2
-3,12
-496,2aa,195
-495,29a,195
-4a6,2ab,1a5
-485,29a,185
-4a6,2ab,1a5
-495,29a,195
-495,29a,195
-4a6,2ab,1a5
-485,29a,185
-4a6,2ab,1a5
-495,29a,195
-495,2aa,195
+6,12
+475,28a,185,4c6,2cb,1c5
+4c6,2cc,1c5,455,269,165
+4b6,2bb,1b5,4a6,2ab,1a6
+454,258,155,4c6,2cc,1c6
+4c6,2cb,1c5,495,29a,196
+4c6,2cc,1c5,465,279,176
+465,279,165,4c6,2cc,1c5
+496,29a,195,4c6,2cb,1c5
+4c6,2cc,1c5,455,258,155
+4a5,2ab,1a6,4b6,2bb,1b5
+465,269,166,4c6,2cc,1c6
+4c6,2cb,1c5,485,28a,185

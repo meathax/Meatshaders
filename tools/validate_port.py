@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fileio
 import fitting
-import mister_model as mm
+import mister_model as mm  # noqa: F401  (imported for its RTL-arithmetic model)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = (r"C:\Users\meath\AppData\Local\Temp\claude\D--Arcade-AI-shaders"
@@ -33,6 +33,7 @@ PORTS = {
     "guest": ("guest_advanced_ref", "CRT Guest Advanced (Port)", "CRT Guest Advanced"),
     "royale": ("royale_ref", "CRT Royale (Port)", "CRT Royale"),
     "kurozumi": ("kurozumi_ref", "CRT Royale Kurozumi (Port)", "CRT Royale Kurozumi"),
+    "easymode": ("easymode_ref", "CRT Easymode v5 (Port)", "CRT Easymode v5"),
 }
 
 hard_fail = []
@@ -112,14 +113,31 @@ for key, (modname, fb, pb) in PORTS.items():
         hard_fail.append(f"{fb}: over-unity V row {worst}")
 
     # --- 2. RMSE ------------------------------------------------------------------
+    # The masked metric is the acceptance number: it compares port pixels
+    # against shader pixels THROUGH the mask, so it sees clamp-order error and
+    # is meaningful for gain-split builds (where mask-off is G times dark by
+    # construction). Mask-off is reported alongside for continuity only.
     va = parsed["VA"]
-    rmse, emax = simulate_grid(ref, va.dark, va.bright, parsed["H"].sets[0], lut)
-    print(f"end-to-end RMSE vs reference (mask off): {rmse:.3f} codes "
-          f"(max |err| {emax:.1f})   [v4 Lottes benchmark: 1.8, Easymode: 4.0]")
+    m_target = fitting.mask_encoded_tile(ref)
+    rmse, emax = fitting.rmse_exact_masked(ref, va.dark, va.bright,
+                                           parsed["H"].sets[0], lut, mask.tokens,
+                                           m_target)
+    rmse_off, _ = simulate_grid(ref, va.dark, va.bright, parsed["H"].sets[0], lut)
+    print(f"end-to-end RMSE through the mask: {rmse:.3f} codes (max |err| {emax:.1f})"
+          f"   [mask off, for continuity: {rmse_off:.3f}]")
+    # Non-adaptive (v6) cores silently receive only the FIRST coefficient set.
+    rdark, _ = fitting.rmse_exact_masked(ref, va.dark, va.dark, parsed["H"].sets[0],
+                                         lut, mask.tokens, m_target)
+    print(f"degradation on a non-adaptive core (dark set only): {rdark:.3f} codes")
 
-    # fixed-table RMSE for the compatibility preset
+    # fixed-table RMSE against its own paired LUT (what the preset actually loads)
+    fixed_lut_path = os.path.join(ROOT, "Gamma", f"{fb} Fixed.txt")
+    fixed_lut = fileio.parse_gamma(fixed_lut_path)
+    problems_f = fileio.validate_gamma(fixed_lut, f"{fb} Fixed gamma")
+    if problems_f:
+        hard_fail += problems_f
     rmse_f, emax_f = simulate_grid(ref, parsed["VF"].sets[0], parsed["VF"].sets[0],
-                                   parsed["H"].sets[0], lut)
+                                   parsed["H"].sets[0], fixed_lut)
     print(f"fixed-fallback RMSE: {rmse_f:.3f} codes (max |err| {emax_f:.1f})")
 
     # --- 3. brightness parity -------------------------------------------------------

@@ -249,3 +249,108 @@ linear-light vs encoded filtering order, curvature.
 As with v4: mathematical/RTL validation only; no physical A/B on this
 machine. The 1080p moire guard passes for all shipped adaptive tables at
 4.5x and 4.821x; vscale_mode=1 is recommended for Kurozumi regardless.
+
+
+====================================================================
+ V5.1 AUDIT (2026-07-17) - SECOND PASS OVER THE WHOLE PACK
+====================================================================
+
+THE METRIC WAS WRONG, AND IT MATTERED
+-------------------------------------
+V5.0 scored ports with the mask disabled. That measurement assumes the port's
+mask equals the shader's, so it is blind to clamp-ORDER error (the shader
+clips clamp(beam*mask) AFTER the mask; MiSTer clamps the V stage and then
+saturates inside the mask) and it is actively inverted for any factorization
+that puts gain in the mask. All v5.1 numbers below use rmse_exact_masked:
+port pixels vs shader pixels through the mask, roll-invariant.
+
+Some v5.1 numbers are therefore WORSE than the v5.0 figures for the same
+files. That is the metric telling the truth for the first time, not a
+regression - and one such reveal (Royale's mask) was a real defect.
+
+RESULTS (masked metric, output codes)
+-------------------------------------
+                        v5.1     v5.0-era     non-adaptive core
+  Guest Advanced        2.55       2.68            19.97
+  Easymode v5           3.16       4.97 (v4)       20.67
+  Royale               18.23      15.49*           77.49
+  Royale Kurozumi      25.98      10.73*           66.06
+  Lottes (v4, kept)     1.23        -               1.13
+  * mask-off figures, not comparable; see above.
+
+  Fixed-fallback presets: Guest 4.55, Easymode 9.61, Royale 23.20,
+  Kurozumi 17.51 (each now with its own jointly-fitted gamma LUT).
+
+FIVE DEFECTS FOUND AND FIXED
+----------------------------
+1. Royale's mask had lost ALL slot structure. The tile was built by averaging
+   the shader's 24x24 slot pattern to a hardware-legal size; that pattern is
+   antisymmetric under y -> y+12, so averaging cancelled the slot modulation
+   to exactly zero - and because mean-averaging is L2-optimal, the RMSE metric
+   REWARDED the destruction. Now a verbatim slice (12x6), slot preserved.
+
+2. Kurozumi's mask used the wrong encode exponent (2.2 hardcoded; its
+   lcd_gamma is 2.4): red +2.4%, blue -4.9% off target.
+
+3. Kurozumi's grille is unrepresentable in one v2 token per pixel (both
+   non-selected channels share one nibble, but the target needs green ~1.01
+   and blue ~0.57). The single-token fit spent blue to buy luma and flattened
+   the R/B ripple to 61%. Dithering across two horizontal positions restores
+   it to 100% at 4.7x lower error (exact-arithmetic 14.5 -> 3.0 codes), with
+   no vertical structure added - a vertical dither would beat against the
+   4.5x scanline (measured up to 3.6 codes).
+
+4. Systematic truncation bias: MiSTer's FIR floors, so a unity-gain row
+   returns g-1 and every fitted level sat 1-4 codes dark. Refinement now runs
+   in the loop against the exact model.
+
+5. Black lift: the LUT generator flat-extrapolated below its lowest sample,
+   lifting codes 0..8 to 7.
+
+THE GAIN-SPLIT (the main fidelity gain)
+---------------------------------------
+MiSTer's gamma LUT is both the tone curve AND the adaptive filter's control
+signal. Wherever a shader's beam-centre transfer clips, the LUT pins at 255 -
+and the control pins with it, so every input across that band renders with one
+frozen scanline profile while the true trough still varies. Easymode clips from
+x=0.849 (15% of the range); Lottes from 0.912.
+
+Fix: the LUT carries the PRE-clip beam divided by a gain G, and the mask
+carries G. The LUT keeps rising, the control keeps resolving levels, and
+saturation moves to the mask stage - which is where the shader clips too, so
+the clamp order matches as well. G is bounded by the mask's DARK multipliers
+(the shared nibble caps at 15/16), not the lit ones.
+
+  Easymode  G=1.105  ->  3.16 codes  (vs 8.37 with the plain factorization,
+                                      4.97 for v4)
+
+Independent confirmation: the search re-derives v4's 42f mask for Easymode and
+the 47e family for Lottes without being told. v4's authors found this
+empirically; it now falls out of the arithmetic.
+
+LOTTES: MEASURED, THEN LEFT ALONE
+---------------------------------
+The shipped v4 Lottes scores 1.233 against a best-achievable 1.208 on the same
+metric - within 2%. Its gamma=off + gain-in-mask factorization already mirrors
+the shader's clamp order, and its two adaptive sets are nearly identical, which
+is why it degrades gracefully (1.13) on non-adaptive cores. A rebuild was built
+and rejected: no meaningful gain, real risk to the pack's best asset.
+
+REMAINING IRREDUCIBLE ERROR
+---------------------------
+Kurozumi (25.98) is dominated by its own transfer saturating at x=0.738 - the
+top 26% of the input range collapses to one control value. A gain-split would
+help, but its clipping cascade has several internal clamps rather than one
+final clamp, so no single pre-clip beam is well defined; not attempted.
+
+Royale (18.23) remains dominated by the non-monotone scanline depth documented
+in the v5 audit, plus the mask's now-honest clamp-order cost.
+
+Both Default presets degrade badly on cores without adaptive filter support
+(77 and 66 codes) because their two coefficient sets differ greatly. Use the
+Fixed Compatibility presets there - this is why they exist.
+
+Two horizontal error sources remain invisible to every flat-field metric in
+this pack: the anti-ringing clamp (Easymode, ~6 codes RMS on midtone content)
+and linear-vs-encoded filtering order (up to ~81 codes on a hard black/white
+edge). Both are horizontal-only and unfixable within a single pre-scaler LUT.
