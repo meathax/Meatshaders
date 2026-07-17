@@ -1071,6 +1071,100 @@ def fit_mask_tile(ref, gain: float = 1.0, max_dim: int = 16,
     return tokens, info
 
 
+def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
+                   h: np.ndarray, tokens: list[list[str]],
+                   mask_encoded: np.ndarray, dither_group: int | None = None,
+                   codes: np.ndarray | None = None) -> tuple[list[list[str]], float]:
+    """Refit the mask tokens to minimize END-TO-END masked error.
+
+    fit_mask_tile matches the shader's mask multipliers in isolation, which is
+    the wrong objective: it leaves the mask unable to compensate for anything
+    upstream. Two things it therefore cannot fix, and this can:
+
+      * CLAMP ORDER. The shader clips clamp(B*m) after the mask; MiSTer clamps
+        the V stage and then saturates inside the mask. Matching m exactly bakes
+        that mismatch in.
+      * V/LUT RESIDUAL. The fitted filters are not exact, and the mask
+        multiplies whatever they produce — so the best token is the one that
+        minimizes the error of the PRODUCT, not of the multiplier.
+
+    Consequence in practice: the shipped Royale tile peaks at 1.625 encoded
+    where the hardware ceiling is 1.9375, leaving flat white ~24% dark. The
+    mask has headroom the isolated fit never asks for.
+
+    Per output cell this is a search over all 7*16*16 tokens scored through the
+    exact mask arithmetic against the real simulated pre-mask output — cheap,
+    and exact rather than a heuristic. `dither_group`: cells xx, xx+group, ...
+    are repeats of one target column, so their MEAN is what must match.
+    Returns (tokens, masked rmse).
+    """
+    import fileio
+    if codes is None:
+        codes = np.arange(8, 256, 4)
+    fs = np.arange(0, 33) / 64.0
+    h_tile, w_tile, _ = mask_encoded.shape
+    rows, cols = len(tokens), len(tokens[0])
+    group = dither_group or cols
+
+    # Pre-mask simulated output and the shader's pre-clip beam, per level.
+    sims, beams = [], []
+    for code in codes:
+        sims.append(simulate_flat_rgb(dark, bright, h, lut, int(code), fs))
+        beams.append(np.array([_ref_vertical_unclipped(ref, f, int(code) / 255.0)
+                               for f in fs]))
+    V = np.stack(sims)                                   # (NC, F, 3)
+    B = np.stack(beams)                                  # (NC, F)
+
+    names, resp = [], []
+    for bm in range(1, 8):
+        sel = np.array([bool(bm & 4), bool(bm & 2), bool(bm & 1)])
+        for y in range(16):
+            for z in range(16):
+                m16 = np.where(sel, 16 + y, z)
+                names.append(fileio.encode_mask_token(bm, 16 + y, z))
+                resp.append(mm.mask_multiply(V.reshape(-1, 3),
+                                             m16[None, :]).reshape(V.shape))
+    R = np.stack(resp).astype(np.float64)                # (NT, NC, F, 3)
+
+    out = [list(r) for r in tokens]
+    for yy in range(rows):
+        for xx in range(group):
+            members = list(range(xx, cols, group))
+            tgt = 255.0 * np.minimum(
+                B[:, :, None] * mask_encoded[yy % h_tile, xx % w_tile][None, None, :], 1.0)
+            if len(members) == 1:
+                err = ((R - tgt[None]) ** 2).sum(axis=(1, 2, 3))
+                out[yy][members[0]] = names[int(np.argmin(err))]
+            else:
+                # Dithered: pick the pair whose MEAN response fits best.
+                flat = R.reshape(len(names), -1)
+                t = tgt.ravel()
+                a = 0.25 * (flat * flat).sum(axis=1) - flat @ t
+                G = flat @ flat.T
+                e = a[:, None] + a[None, :] + 0.5 * G + float(t @ t)
+                i, j = np.unravel_index(int(np.argmin(e)), e.shape)
+                for k, mi in enumerate(members):
+                    out[yy][mi] = names[i if k % 2 == 0 else j]
+    r, _ = rmse_exact_masked(ref, dark, bright, h, lut, out, mask_encoded)
+    return out, r
+
+
+def simulate_flat_rgb(dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                      lut: np.ndarray, code: int, fs: np.ndarray) -> np.ndarray:
+    """(F, 3) exact pre-mask output for a uniform field of `code`."""
+    lines = np.empty(16, dtype=np.int64)
+    lines.fill(int(lut[code].max()))
+    hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+    ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+    per_ch = []
+    for c in range(3):
+        lines.fill(int(lut[code, c]))
+        hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+        lines.fill(hout)
+        per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
+    return np.stack(per_ch, axis=1)
+
+
 def _tile_exact_err(tokens: list[list[str]], target: np.ndarray,
                     group: int | None = None) -> float:
     """Exact-arithmetic luma-weighted RMSE (output codes) of a token grid.

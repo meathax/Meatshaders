@@ -293,10 +293,14 @@ New: CRT Royale Kurozumi - Anti-Moire, for anyone running non-integer vertical
 scaling (vscale_mode=0) who sees faint line-thickness ripple on the standard
 Kurozumi preset. With vscale_mode=1 you do not need it.
 
-Remaining known gap: for Royale and Kurozumi the dominant error is now the
-shadow mask, not the filters - their masks are under-driven versus what the
-hardware could deliver. That is the next improvement and it is independent of
-everything above.
+The Royale mask was also rebuilt. It had been fitted to match the shader's
+mask in isolation, which sounds right but is the wrong goal: the mask is the
+last stage, so what matters is the accuracy of the finished pixel, not of the
+multiplier. Fitted that way it was leaving the picture ~24% dark at flat white
+while the hardware had headroom to spare. Refitting against the actual output
+improved Royale by 12% and cut its worst-case error by a third. The same refit
+was tried on every other preset and changed nothing - they were already at
+their best, which is the answer you want from a check like that.
 
 V5.1 REVISIONS (2026-07-17)
 ---------------------------

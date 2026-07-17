@@ -418,3 +418,44 @@ HONEST NOTES
   detected this and emitted CRT Royale Kurozumi - Anti-Moire automatically
   (widened beam, 2.29). Note the guard only matters at FRACTIONAL vertical
   scales; with vscale_mode=1 (integer scaling) it is moot.
+
+
+JOINT MASK REFIT
+----------------
+Fitting the mask to the shader's multipliers in isolation is the wrong
+objective: it leaves the mask unable to compensate for anything upstream. Two
+things it therefore cannot fix - the clamp-order mismatch (the shader clips
+clamp(B*m) after the mask; MiSTer clamps the V stage then saturates inside the
+mask), and the V/LUT residual, since the mask multiplies whatever the filters
+actually produce. The best token minimises the error of the PRODUCT.
+
+fit_mask_joint refits each cell against the real simulated pre-mask output
+(exhaustive over all 7*16*16 tokens, exact mask arithmetic). It is self-gating
+- adopted only where it measurably wins:
+
+  Royale            16.555 -> 14.616 codes (-11.7%), max 94.0 -> 66.2  ADOPTED
+  Guest Advanced     1.156 -> 1.156   no change                        declined
+  Easymode v5        3.156 -> 3.156   no change                        declined
+  Kurozumi          24.616 -> 24.733  slightly worse                   declined
+
+Royale was the case the analysis predicted (its tile peaked at 1.625 encoded
+against a 1.9375 ceiling - the mask had headroom the isolated fit never asked
+for). The three declines are informative rather than disappointing: they
+confirm those masks were already at their joint optimum. Easymode is the
+strongest check - the gain-split had independently arrived at 42f, which the
+joint refit then re-derived as optimal without being told.
+
+WHERE THE PACK STANDS (masked metric, the acceptance number)
+------------------------------------------------------------
+  Lottes (v4, kept)      1.23     verified already near-optimal (floor 1.21)
+  Guest Advanced         1.16
+  Easymode v5            3.16     (v4 Easymode: 4.97)
+  Royale                14.62
+  Royale Kurozumi       24.62
+
+Kurozumi is now the pack's weakest port and its error is NOT the mask or the
+filters - it is its own transfer saturating at x=0.738, which collapses the
+top 26% of the input range onto a single adaptive control value. Escaping that
+needs the gain-split, which needs a well-defined pre-clip beam; Kurozumi's
+clipping cascade has several internal clamps rather than one final clamp, so
+no such beam exists. Documented as the standing limit, not attempted.

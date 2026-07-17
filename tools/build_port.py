@@ -166,6 +166,25 @@ def build(key: str) -> None:
             print(f"[{key}] refine pass {it + 1}: RMSE "
                   f"{rmse_exact(ref, dark, bright, h, lut):.3f} codes (mask off)")
 
+    # ---- mask, refit against the finished filters ---------------------------
+    # The isolated fit matched the shader's multipliers; now that the V/LUT are
+    # known, refit so the mask minimizes the error of the PRODUCT (absorbing
+    # clamp-order and filter residual). Self-gating: kept only if it measurably
+    # wins, since where the isolated fit was already optimal this is a no-op.
+    r_before, _ = fitting.rmse_exact_masked(ref, dark, bright, h, lut, tokens, m_target)
+    dgroup = len(tokens[0]) // 2 if minfo["dithered"] else None
+    tok_j, r_after = fitting.fit_mask_joint(ref, lut, dark, bright, h, tokens,
+                                            m_target, dither_group=dgroup)
+    if r_after < r_before - 0.05:
+        print(f"[{key}] mask refit (joint): masked RMSE {r_before:.3f} -> "
+              f"{r_after:.3f} codes -- adopted")
+        tokens = tok_j
+        minfo["joint_refit"] = True
+    else:
+        print(f"[{key}] mask refit (joint): {r_after:.3f} vs {r_before:.3f} "
+              f"-- isolated fit already optimal, kept")
+        minfo["joint_refit"] = False
+
     gain_note = (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
                  f"the mask carries {gain:.3f}" if gain else
                  "LUT carries the beam-centre transfer")
