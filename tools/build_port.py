@@ -34,6 +34,10 @@ if not os.path.isdir(TARGETS):
 sys.path.insert(0, TARGETS)
 
 COMMIT = "3b0d6aa1d134a168478cd9c904a866d969f8882b"
+# The three Guest families are built from guest.r's upstream release drop,
+# which supersedes the libretro pin for them (verified identical at defaults
+# for the advanced chain; see tools/targets/guest_*_ref.py provenance).
+GUEST_SOURCE = "crt-guest-advanced-2026-07-12-release1"
 
 SHADERS = {
     "guest": {
@@ -41,9 +45,34 @@ SHADERS = {
         "file_base": "CRT Guest Advanced (Port)",
         "preset_base": "CRT Guest Advanced",
         "shader_name": "crt-guest-advanced (guest.r)",
+        "source": GUEST_SOURCE,
         "lut_channels": False,
         # transfer() never clips -> no headroom to split; 50e/20e mask is the
         # exact optimum under every weighting tested.
+        "gain": None,
+        "mask_strategy": None,
+    },
+    "guest_fast": {
+        "module": "guest_fast_ref",
+        "file_base": "CRT Guest Advanced Fast (Port)",
+        "preset_base": "CRT Guest Advanced Fast",
+        "shader_name": "crt-guest-advanced-fast (guest.r)",
+        "source": GUEST_SOURCE,
+        "lut_channels": False,
+        # Upstream's performance rewrite of the identical look: its projection
+        # onto MiSTer's fixed pipeline equals the advanced chain exactly, so
+        # the fitter reproduces the advanced tables under this family's name.
+        "gain": None,
+        "mask_strategy": None,
+    },
+    "guest_fastest": {
+        "module": "guest_fastest_ref",
+        "file_base": "CRT Guest Advanced Fastest (Port)",
+        "preset_base": "CRT Guest Advanced Fastest",
+        "shader_name": "crt-guest-advanced-fastest (guest.r)",
+        "source": GUEST_SOURCE,
+        "lut_channels": False,
+        # Single final pass: no glow lift, no pr_scan, transfer(1.0) == 1.0.
         "gain": None,
         "mask_strategy": None,
     },
@@ -141,7 +170,8 @@ def build(key: str) -> None:
     cfg = SHADERS[key]
     ref = __import__(cfg["module"])
     fb, pb = cfg["file_base"], cfg["preset_base"]
-    provenance = f"{cfg['shader_name']}; libretro/slang-shaders @ {COMMIT[:12]}"
+    source = cfg.get("source", f"libretro/slang-shaders @ {COMMIT[:12]}")
+    provenance = f"{cfg['shader_name']}; {source}"
     made = []
 
     # ---- H filter (needed early: the exact refinement simulates through it) --

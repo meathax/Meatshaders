@@ -1,8 +1,14 @@
 """
 Reference implementation of CRT-GUEST-ADVANCED (guest.r) at DEFAULT parameters.
 
-Source: libretro/slang-shaders @ 3b0d6aa1d134a168478cd9c904a866d969f8882b (master, 2026-07-15)
-Preset: crt/crt-guest-advanced.slangp  (sets NO parameter overrides -> pure #pragma defaults)
+Source: crt-guest-advanced-2026-07-12-release1 (guest.r upstream release drop,
+        D:/Downloads/crt-guest-advanced-2026-07-12-release1).  Verified line by
+        line against libretro/slang-shaders @ 3b0d6aa1d134 (master, 2026-07-15):
+        at DEFAULT parameters the two are numerically identical -- the release
+        adds only `ssharp` (0.0 -> ssub term vanishes) and `bloomsamp`
+        (0.0 -> st() keeps wts=-10 and the BloomPass mix is skipped), and the
+        glow/bloom sigma rescale factors are exactly 1 at default sizes.
+Preset: crt-guest-advanced.slangp  (sets NO parameter overrides -> pure #pragma defaults)
 
 Pass chain (12 passes):
   0 stock, 1 stock(StockPass), 2 afterglow0(AfterglowPass), 3 pre-shaders-afterglow(PrePass),
@@ -72,9 +78,10 @@ DEFAULTS = {
 }
 
 PROVENANCE = {
-    "repo": "libretro/slang-shaders",
-    "commit": "3b0d6aa1d134a168478cd9c904a866d969f8882b",
-    "preset": "crt/crt-guest-advanced.slangp",
+    "source": "crt-guest-advanced-2026-07-12-release1 (guest.r release drop)",
+    "cross_check": "libretro/slang-shaders @ "
+                   "3b0d6aa1d134a168478cd9c904a866d969f8882b (identical at defaults)",
+    "preset": "crt-guest-advanced.slangp",
     "preset_overrides": "none",
 }
 
@@ -154,7 +161,7 @@ def ref_vertical(f, x, mask_mult=1.0):
                       mx = mxg^(1.40/gamma_in) with mxg = E  (uniform field)
                       mask apply in linear (mask_gamma==gamma_in): color *= cmask
                       dark_compensate dc = mix(max(clamp(mix(mcut,maskstr,mx),0,1)-1+fract(mwidth),0)+1, 1, mx)
-                                       = 1 + (1-mx)*max(0.1-0.8*mx, 0)   [mwidth=2.0 -> fract=0]
+                                       = 1.0 identically   [clamp caps at 1; fract(mwidth)=0]
                       bb = mix(1.40, 1.10, mx) * dc ; color *= bb ; clamp
                       glow (m_glow<0.5): Glow = mix(E, 0.25*color, colmx)
                                          color += 0.5*Glow*glow = 0.04*Glow ; clamp
@@ -186,8 +193,15 @@ def ref_vertical(f, x, mask_mult=1.0):
     # mask application (mask_gamma == gamma_in -> plain linear multiply)
     color = min(color * mask_mult, 1.0)
 
-    # dark compensate (shadowMask=0 -> mwidths[0]=2.0 -> mask_compensate = 0.0)
-    dc = (1.0 - mx) * max(0.1 - 0.8 * mx, 0.0) + 1.0
+    # dark compensate (shadowMask=0 -> mwidths[0]=2.0 -> mask_compensate = 0.0):
+    #   mix(max(clamp(mix(mcut,maskstr,mx),0,1) - 1 + mask_compensate, 0) + 1, 1, mx)
+    # The shader clamps mix(1.10, 0.3, mx) to [0,1] BEFORE subtracting 1, so
+    # with mask_compensate = 0 the max() term is identically 0 and dc == 1.0.
+    # (An earlier revision of this module dropped the upper clamp, boosting
+    # near-black targets by up to 10%; keep the literal expression so any
+    # future mcut/maskstr/mask edits stay faithful.)
+    a = max(min(max(1.10 + (0.3 - 1.10) * mx, 0.0), 1.0) - 1.0 + 0.0, 0.0) + 1.0
+    dc = a * (1.0 - mx) + mx
     bb = (1.40 + (1.10 - 1.40) * mx) * dc
     color = min(color * bb, 1.0)
 
@@ -350,6 +364,20 @@ def _validate(verbose=True):
     expect = (c2 * pr) ** (1 / 2.4)
     checks.append(("transfer(0.5)", transfer(0.5), expect, 1e-12))
     checks.append(("transfer(0.5)~hand", transfer(0.5), 0.5613, 5e-4))
+
+    # 2b) transfer(0.1) near-black: dark_compensate must be EXACTLY 1.0 (the
+    # pre-subtract clamp caps mix(1.1,0.3,mx) at 1).  E=0.1^2.4, mx=0.1^1.4,
+    # bb=1.4-0.3mx; c1=E*bb; glow=E*(1-E)+0.25*c1*E; c2=c1+0.04*glow;
+    # w3=((E-.0005)*1.0005+.0001)/(E+.0005); pr=1+0.1*(0.5*(1+w3)*(1-mx)+w3*mx-1)
+    E = 0.1 ** 2.4
+    mx = 0.1 ** 1.4
+    c1 = E * (1.4 - 0.3 * mx)
+    g = E * (1 - E) + 0.25 * c1 * E
+    c2 = c1 + 0.04 * g
+    w3 = min((max((E - 0.0005) * 1.0005, 0) + 0.0001) / (E + 0.0005), 1.0)
+    pr = 1 + 0.1 * ((0.5 * (1 + w3)) * (1 - mx) + w3 * mx - 1)
+    expect = (c2 * pr) ** (1 / 2.4)
+    checks.append(("transfer(0.1) dc==1", transfer(0.1), expect, 1e-12))
 
     # 3) beam_weight(0.5, 1.0): tmp=1.0, shape=7, 2^(-7*0.25)=2^-1.75=0.297302
     checks.append(("beam_weight(0.5,1.0)", beam_weight(0.5, 1.0), 2 ** -1.75, 1e-12))

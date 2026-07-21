@@ -109,16 +109,30 @@ original shader programs. See README.txt and AUDIT_REPORT.txt for limitations.
 Canonical shader sources (libretro/slang-shaders, all pinned to commit
 3b0d6aa1d134a168478cd9c904a866d969f8882b):
 
-CRT Guest Advanced (by guest.r, GPL):
+CRT Guest Advanced (by guest.r, GPL) - SUPERSEDED 2026-07-21 for the Guest
+families by guest.r's upstream release drop (see below); the libretro pin
+remains the cross-check reference:
   crt/crt-guest-advanced.slangp and crt/shaders/guest/advanced/*
 CRT Royale (by TroggleMonkey, GPL):
   crt/crt-royale.slangp and crt/shaders/crt-royale/src/*
 CRT Royale Kurozumi (P22/PVM parameter preset over crt-royale):
   presets/crt-royale-kurozumi.slangp (+ grade.slang pass)
 
+Guest source of truth (2026-07-21): guest.r upstream release drop
+  crt-guest-advanced-2026-07-12-release1
+  local copy: D:/Downloads/crt-guest-advanced-2026-07-12-release1
+  presets: crt-guest-advanced.slangp, crt-guest-advanced-fast.slangp,
+           crt-guest-advanced-fastest.slangp (no parameter overrides; pure
+           #pragma defaults; GPL, Copyright guest(r) 2018-2026)
+  Verified pass by pass against the libretro pin above: the advanced chain is
+  numerically identical at default parameters (new ssharp/bloomsamp params
+  default off; glow/bloom sigma rescales are 1 at default radii).
+
 Reproducible executable references are vendored in tools/targets/:
   easymode_ref.py
   guest_advanced_ref.py
+  guest_fast_ref.py
+  guest_fastest_ref.py
   kurozumi_ref.py
   lottes_ref.py
   royale_ref.py
@@ -156,5 +170,6 @@ scores the full periodic LCM supercell at strict origin, refines Kurozumi
 channel-aware through its colored black lift, and gates gamma quality,
 clipping, moire, RMS and maximum individual-pixel error.
 
-Guest Advanced and Royale sources are GPL; the derived coefficient tables
-retain that licensing status. Kurozumi is a parameter set over Royale.
+Guest Advanced (all three variants) and Royale sources are GPL; the derived
+coefficient tables retain that licensing status. Kurozumi is a parameter set
+over Royale.

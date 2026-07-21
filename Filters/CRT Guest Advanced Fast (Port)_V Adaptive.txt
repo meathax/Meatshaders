@@ -1,5 +1,5 @@
-# Name: CRT Guest Advanced (Port)_V Adaptive
-# Original shader: crt-guest-advanced (guest.r); crt-guest-advanced-2026-07-12-release1
+# Name: CRT Guest Advanced Fast (Port)_V Adaptive
+# Original shader: crt-guest-advanced-fast (guest.r); crt-guest-advanced-2026-07-12-release1
 # Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
 # Pair with the matching (Port) gamma and mask; behaviourally clip-safe
 # Endpoint rows may exceed unity where the adaptive blend keeps output in range

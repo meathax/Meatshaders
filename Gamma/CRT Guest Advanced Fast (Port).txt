@@ -1,5 +1,5 @@
-# Name: CRT Guest Advanced (Port)
-# crt-guest-advanced (guest.r); crt-guest-advanced-2026-07-12-release1
+# Name: CRT Guest Advanced Fast (Port)
+# crt-guest-advanced-fast (guest.r); crt-guest-advanced-2026-07-12-release1
 # Monotone adaptive-control warp co-optimized with the V fit
 # Co-optimized with the adaptive V fit and refined against MiSTer's
 # exact truncating arithmetic; pair with the matching (Port) files

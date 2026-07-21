@@ -1,10 +1,15 @@
 # MiSTer CRT canonical 1080p design
 
-Date: 2026-07-17. The pack contains one landscape preset and one transposed
-TATE preset for each of five shader families: Easymode, Guest Advanced,
+Date: 2026-07-17; Guest expansion 2026-07-21. The pack contains one landscape
+preset and one transposed TATE preset for each of seven shader families:
+Easymode, Guest Advanced, Guest Advanced Fast, Guest Advanced Fastest,
 Lottes, Royale, and Royale Kurozumi. Reference math is vendored in
-`tools/targets/` and pinned to libretro/slang-shaders commit
-`3b0d6aa1d134a168478cd9c904a866d969f8882b`.
+`tools/targets/`. The non-Guest families are pinned to libretro/slang-shaders
+commit `3b0d6aa1d134a168478cd9c904a866d969f8882b`; the three Guest families
+are built from guest.r's upstream release drop
+`crt-guest-advanced-2026-07-12-release1` (verified numerically identical to
+the libretro pin at defaults for the advanced chain, which also serves as the
+cross-check).
 
 These are deterministic fixed-pipeline approximations, not executable GPU
 shaders. The objective is the closest result MiSTer's gamma LUT, separable
@@ -13,14 +18,25 @@ an exact 1920x1080 output grid.
 
 ## Canonical runtime contract
 
-The runtime manifest is exact: 14 filters, four gamma LUTs, five masks, and ten
-presets. There are no selectable compatibility or alternate-look presets.
+The runtime manifest is exact: 20 filters, six gamma LUTs, seven masks, and
+fourteen presets. There are no selectable compatibility or alternate-look
+presets.
 
-Easymode, Guest Advanced, Royale, and Royale Kurozumi each use a fixed H table,
-an adaptive V table, an interlace-safe no-scanline V table, one fitted LUT, and
-one mask. Landscape puts adaptation on V. TATE transposes the source axes,
-puts the adaptive table on H, uses the fixed H response on V/interlace, and
-selects `maskmode=1x rotated`.
+Every family except Lottes uses a fixed H table, an adaptive V table, an
+interlace-safe no-scanline V table, one fitted LUT, and one mask. Landscape
+puts adaptation on V. TATE transposes the source axes, puts the adaptive
+table on H, uses the fixed H response on V/interlace, and selects
+`maskmode=1x rotated`.
+
+Guest Advanced Fast is upstream's performance rewrite of the identical look:
+its fixed-pipeline projection equals the advanced chain exactly at defaults
+(validated contract in `guest_fast_ref.py`), so its family files carry the
+same coefficients under their own names. Guest Advanced Fastest is a real
+variant: its single final pass has no glow lift, no pr_scan multiply and no
+w3-epsilon dimming (`transfer(1.0) == 1.0`), and gets its own LUT/V/mask fit.
+The Guest re-audit also corrected the reference's dark_compensate term, which
+the shader clamps to identically 1.0 at defaults; the previous model boosted
+near-black targets by up to 10% below input code ~58.
 
 Lottes uses one fixed H/V pair, gamma off, and one mask. Its beam shape is
 brightness-independent, so the fixed vertical fit is measurably closer than an
@@ -93,7 +109,9 @@ End-to-end reference RMS and worst stability scores are:
 | Family | Masked RMS | Worst 1080p moire |
 |---|---:|---:|
 | Easymode | 3.591 | 5.50 |
-| Guest Advanced | 1.230 | 5.00 |
+| Guest Advanced | 1.237 | 4.50 |
+| Guest Advanced Fast | 1.237 | 4.50 |
+| Guest Advanced Fastest | 1.160 | 5.50 |
 | Lottes | 1.166 | 3.50 |
 | Royale | 19.968 | 7.00 |
 | Royale Kurozumi | 19.854 | 6.65 |

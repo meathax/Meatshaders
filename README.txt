@@ -1,13 +1,15 @@
 ====================================================================
  CRT SHADER PORTS FOR MiSTer - CANONICAL 1080p EDITION
- Pixel-accuracy build, 2026-07-17
+ Pixel-accuracy build, 2026-07-17; Guest expansion 2026-07-21
 ====================================================================
 
-This pack contains one canonical 1920x1080 setup for each of five CRT shader
+This pack contains one canonical 1920x1080 setup for each of seven CRT shader
 families:
 
   CRT Easymode
   CRT Guest Advanced
+  CRT Guest Advanced Fast
+  CRT Guest Advanced Fastest
   CRT Lottes
   CRT Royale
   CRT Royale Kurozumi
@@ -19,6 +21,10 @@ landscape/default preset; "- TATE" is its correctly transposed portrait form:
   CRT Easymode - TATE.ini
   CRT Guest Advanced.ini
   CRT Guest Advanced - TATE.ini
+  CRT Guest Advanced Fast.ini
+  CRT Guest Advanced Fast - TATE.ini
+  CRT Guest Advanced Fastest.ini
+  CRT Guest Advanced Fastest - TATE.ini
   CRT Lottes.ini
   CRT Lottes - TATE.ini
   CRT Royale.ini
@@ -44,17 +50,17 @@ result instead of claiming that the shader program itself was ported.
 
 Runtime inventory:
 
-  Filters:       14
-  Gamma LUTs:     4
-  Shadow masks:   5
-  Presets:       10
+  Filters:       20
+  Gamma LUTs:     6
+  Shadow masks:   7
+  Presets:       14
 
 The filter count is larger than the preset count because presets compose
-internal stages. Easymode, Guest Advanced, Royale and Royale Kurozumi each use
-an H table, an adaptive V table and an interlace-safe no-scanline V table.
-TATE transposes the H/adaptive-V pair and reuses those same files. Lottes uses
-one fixed H/V pair. These extra files are implementation stages, not additional
-looks to choose from.
+internal stages. Every family except Lottes uses an H table, an adaptive V
+table and an interlace-safe no-scanline V table. TATE transposes the
+H/adaptive-V pair and reuses those same files. Lottes uses one fixed H/V pair.
+These extra files are implementation stages, not additional looks to choose
+from.
 
 
 INSTALLATION
@@ -88,11 +94,11 @@ Do not ask a 4K panel to rescale these masks without accepting a different
 phosphor pitch. The target is a real 1920x1080 output grid with no additional
 display scaling.
 
-Easymode, Guest Advanced, Royale and Royale Kurozumi require MiSTer's v7
-adaptive-filter interface for their canonical result. Their presets use the
-gamma LUT and one adaptive scaler axis. Lottes is intentionally fixed: its
-source scan profile is brightness-independent, so a fixed V table is the
-canonical mapping and gamma remains off.
+Every family except Lottes requires MiSTer's v7 adaptive-filter interface for
+its canonical result. Their presets use the gamma LUT and one adaptive scaler
+axis. Lottes is intentionally fixed: its source scan profile is
+brightness-independent, so a fixed V table is the canonical mapping and gamma
+remains off.
 
 Only one scaler axis can be adaptive. Landscape places adaptation on V; TATE
 places it on H and uses the fixed H response on V. The preset files encode this
@@ -126,6 +132,23 @@ CRT Easymode
 CRT Guest Advanced
   Maps especially closely to MiSTer's adaptive beam and compact mask model.
   Chroma-dependent beam behavior remains an unavoidable shared-control limit.
+  The three Guest families are built from guest.r's upstream release drop
+  crt-guest-advanced-2026-07-12-release1 (the pack's source of truth for
+  Guest), cross-checked against the pinned libretro revision.
+
+CRT Guest Advanced Fast
+  Upstream's performance rewrite of the identical look. Verified line by
+  line: at default parameters its projection onto MiSTer's fixed pipeline is
+  numerically identical to CRT Guest Advanced, so its tables carry the same
+  coefficients under this family's own file names. Choose either; they render
+  the same picture on MiSTer.
+
+CRT Guest Advanced Fastest
+  The single-final-pass variant. Genuinely different response: no glow lift,
+  no preserve-scanline post multiply, and peak white maps to exactly 255
+  (transfer(1.0) = 1.0). Slightly dimmer and marginally shallower troughs
+  than Guest Advanced, matching the upstream fastest chain, and the closest
+  Guest fit in this pack (1.160 codes RMS).
 
 CRT Royale
   Retains source slot structure with a hardware-legal mask slice and fits its
