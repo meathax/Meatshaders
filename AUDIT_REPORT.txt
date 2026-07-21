@@ -53,7 +53,7 @@ Endpoint-inclusive end-to-end RMS is measured through H, V, gamma and mask in
   CRT Guest Advanced:       1.237 codes RMS
   CRT Guest Advanced Fast:  1.237 codes RMS (identical tables; see below)
   CRT Guest Advanced Fastest: 1.160 codes RMS
-  CRT Royale:              19.968 codes RMS
+  CRT Royale:              18.989 codes RMS
   CRT Royale Kurozumi:     19.854 codes RMS
   CRT Easymode:             3.591 codes RMS
   CRT Lottes:               1.166 codes RMS
@@ -88,7 +88,7 @@ period.
   CRT Guest Advanced Fast         2.69             4.50
   CRT Guest Advanced Fastest      2.81             5.50
   CRT Lottes                      1.73             3.50
-  CRT Royale                      3.98             7.00
+  CRT Royale                      4.14             7.00
   CRT Royale Kurozumi             6.65             6.00
 
 
@@ -167,6 +167,38 @@ final pass has no glow lift, no preserve-scanline (pr_scan) multiply and no
 w3-epsilon dimming, so peak white maps to exactly 255 and the overall
 transfer sits slightly below the advanced one. It receives its own LUT, V
 tables and mask fit (1.160 codes RMS, the closest Guest fit in the pack).
+
+
+ROYALE / KUROZUMI / LOTTES RE-AUDIT 2026-07-21
+----------------------------------------------
+The vendored royale_ref, kurozumi_ref and lottes_ref modules were verified
+line by line against their real upstream sources: crt-royale and the
+kurozumi preset (incl. the 2023 grade.slang gray-axis chain: EOTF-1886a
+black level 0.0382, rolled_gain, pure-power 2.4/0.9811 encode, per-channel
+flare +0.0167/+0.0149/+0.0047) at the pinned libretro/slang-shaders
+revision, and crt-lottes.glsl at the pinned libretro/glsl-shaders revision.
+Every default, formula and structural claim checked out, and every audited
+file is byte-identical between the pin and current upstream master, so the
+pinned references are the current real sources.  A reproducibility rebuild
+regenerated the shipped Royale and Kurozumi tables byte-for-byte.
+
+The build gained a final polish stage: a wide-radius mask-aware LUT
+alternation running after the stability blend, gated on exact end-to-end
+improvement, flat-field clip safety AND the release gamma-quantization
+bound (tone smoothness).  Measured outcomes:
+
+  CRT Royale          19.968 -> 18.989 codes RMS (max 89.2 -> 77.0);
+                      brightness parity mid-tones improved to within 1.8
+                      codes; LUT keeps 132 quantization levels.
+  CRT Royale Kurozumi unchanged.  Unconstrained polish reaches 15.999
+                      codes RMS but collapses the LUT to 73-122 levels
+                      (visible banding risk) and worsens white parity to
+                      -11.9; the banding guard rejects it, so the shipped
+                      19.854 fit is the gated optimum.
+  CRT Lottes          unchanged and now measurement-backed: a jointly
+                      fitted gamma LUT + adaptive V scores 2.894 codes RMS
+                      against the shipped gamma-off fixed-table 1.166, so
+                      gamma off remains the canonical Lottes mapping.
 
 
 LOTTES STRICT-ORIGIN CORRECTION

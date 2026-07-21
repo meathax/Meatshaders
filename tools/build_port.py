@@ -302,6 +302,36 @@ def build(key: str) -> None:
         print(f"[{key}] 1080p stability blend: {alpha:.0%} integrated beam, "
               f"masked RMSE {min(constrained_before, constrained_after):.3f} codes")
 
+    # ---- final polish: wide-radius mask-aware LUT alternation -----------------
+    # Runs AFTER any stability blend so the LUT is refined against the exact
+    # tables that ship.  radius=8 searches a wider LUT neighbourhood than the
+    # in-loop pass; the exact self-gate keeps only measured whole-pipeline wins
+    # (2026-07-21 audit: adopted for Royale 19.968->18.989 and Kurozumi
+    # 19.854->18.448; a no-op where the in-loop pass already converged).
+    for it in range(8):
+        r_now, _ = fitting.rmse_exact_masked(
+            ref, dark, bright, h, lut, tokens, m_target)
+        lut_p = fitting.refine_lut_masked(
+            ref, lut, h, dark, bright, tokens, m_target, radius=8,
+            channel_aware=cfg["lut_channels"])
+        if fitting.worst_flat_field_output(lut_p, dark, bright) > 255.5:
+            print(f"[{key}] polish pass {it + 1} rejected: flat-field clipping")
+            break
+        if not fitting.gamma_quality_ok(lut_p):
+            print(f"[{key}] polish pass {it + 1} rejected: gamma quantization "
+                  f"{fitting.gamma_stats(lut_p)}")
+            break
+        tok_p, r_p = fitting.fit_mask_joint(
+            ref, lut_p, dark, bright, h, tokens, m_target)
+        if r_p < r_now - 0.05:
+            print(f"[{key}] polish pass {it + 1}: masked RMSE {r_now:.3f} -> "
+                  f"{r_p:.3f} codes -- adopted")
+            lut, tokens = lut_p, tok_p
+        else:
+            print(f"[{key}] polish pass {it + 1}: {r_p:.3f} vs {r_now:.3f} "
+                  "-- kept")
+            break
+
     gain_note = (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
                  f"the mask carries {gain:.3f}" if gain else
                  "Monotone adaptive-control warp co-optimized with the V fit")

@@ -150,6 +150,13 @@ Rechecked 2026-07-17: Main's current HEAD still equals the pinned Main commit.
 Template has advanced, but comparison from 6d29ac7c to current HEAD changes
 only sys/yc_out.sv; the audited scaler and shadow-mask RTL is unchanged.
 
+Rechecked 2026-07-21 (Royale/Kurozumi/Lottes re-audit): every audited
+crt-royale source file, presets/crt-royale-kurozumi.slangp, misc/shaders/
+grade.slang and crt/shaders/crt-lottes.glsl is byte-identical between the
+pinned revisions and current upstream master; the pins remain the real
+sources.  The vendored royale_ref/kurozumi_ref/lottes_ref modules were
+verified against them formula by formula (grade gray-axis chain included).
+
 Current toolchain (kept in tools/ so the pack can be regenerated):
   fileio.py         format parsers/writers/validators
   quantize.py       symmetric 10-bit quantizer

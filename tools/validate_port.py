@@ -74,7 +74,7 @@ FAMILIES = {
         "gamma": "CRT Royale (Port).txt", "no_scan": True,
         # The 1080p-integrated beam deliberately trades a small amount of
         # source-shape fidelity for a hard full-frame moire pass at 240p.
-        "rmse": 20.10, "max": 90.0, "brightness": 4.0, "selector": 115,
+        "rmse": 19.05, "max": 78.0, "brightness": 4.0, "selector": 95,
     },
     "kurozumi": {
         "module": "kurozumi_ref", "base": "CRT Royale Kurozumi (Port)",

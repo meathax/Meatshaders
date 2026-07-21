@@ -31,6 +31,33 @@ EVAL_CODES = np.concatenate((np.arange(0, 8), np.arange(8, 256, 4),
                              np.arange(253, 256)))
 
 
+def gamma_stats(lut: np.ndarray) -> dict[str, int]:
+    """Tone-smoothness statistics of a (256, 3) LUT.
+
+    Mirrors the release gate in validate_port.py: a LUT that collapses unique
+    levels or grows long plateaus / large steps scores better on flat-field
+    RMSE while banding on real gradients, so refinement passes must respect
+    the same bound the release does (unique >= 128, plateau <= 16, step <= 8).
+    """
+    steps = np.diff(lut, axis=0)
+    unique = min(len(np.unique(lut[:, channel])) for channel in range(3))
+    longest = run = 1
+    for same in np.all(steps == 0, axis=1):
+        run = run + 1 if same else 1
+        longest = max(longest, run)
+    return {
+        "unique": int(unique),
+        "longest_plateau": int(longest),
+        "max_step": int(steps.max(initial=0)),
+    }
+
+
+def gamma_quality_ok(lut: np.ndarray) -> bool:
+    stats = gamma_stats(lut)
+    return (stats["unique"] >= 128 and stats["longest_plateau"] <= 16
+            and stats["max_step"] <= 8)
+
+
 def _transfer(ref, x: float, channel: str | None = None) -> float:
     if channel is not None:
         try:

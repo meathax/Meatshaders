@@ -80,6 +80,15 @@ integrated fit into the unconstrained shader fit. This is the smallest tested
 blend with useful safety margin under the 7.65-code full-frame moire gate; the
 final measured score is 7.00 codes.
 
+Every build ends with a polish stage: a wide-radius mask-aware LUT
+alternation running after any stability blend, self-gated on exact
+end-to-end improvement, flat-field clip safety and the release
+gamma-quantization bound (`fitting.gamma_quality_ok`). The banding guard is
+load-bearing: Kurozumi's unconstrained polish reaches 15.999 codes RMS but
+collapses the LUT below 128 tone levels, so it is rejected and 19.854
+remains its gated optimum, while Royale adopts one clean pass
+(19.968 -> 18.989 with 132 levels kept).
+
 ## Masks
 
 Mask fitting uses exact token shift/add arithmetic and the complete
@@ -113,7 +122,7 @@ End-to-end reference RMS and worst stability scores are:
 | Guest Advanced Fast | 1.237 | 4.50 |
 | Guest Advanced Fastest | 1.160 | 5.50 |
 | Lottes | 1.166 | 3.50 |
-| Royale | 19.968 | 7.00 |
+| Royale | 18.989 | 7.00 |
 | Royale Kurozumi | 19.854 | 6.65 |
 
 The larger Royale/Kurozumi errors expose shader operations the hardware cannot
