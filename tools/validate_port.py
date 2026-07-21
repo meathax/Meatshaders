@@ -47,21 +47,6 @@ FAMILIES = {
         "gamma": "CRT Guest Advanced (Port).txt", "no_scan": True,
         "rmse": 1.30, "max": 8.0, "brightness": 5.0, "selector": 25,
     },
-    "guest_fast": {
-        "module": "guest_fast_ref", "base": "CRT Guest Advanced Fast (Port)",
-        "vertical": "CRT Guest Advanced Fast (Port)_V Adaptive.txt",
-        "adaptive": True,
-        "gamma": "CRT Guest Advanced Fast (Port).txt", "no_scan": True,
-        "rmse": 1.30, "max": 8.0, "brightness": 5.0, "selector": 25,
-    },
-    "guest_fastest": {
-        "module": "guest_fastest_ref",
-        "base": "CRT Guest Advanced Fastest (Port)",
-        "vertical": "CRT Guest Advanced Fastest (Port)_V Adaptive.txt",
-        "adaptive": True,
-        "gamma": "CRT Guest Advanced Fastest (Port).txt", "no_scan": True,
-        "rmse": 1.30, "max": 8.0, "brightness": 5.0, "selector": 25,
-    },
     "lottes": {
         "module": "lottes_ref", "base": "CRT Lottes (Port)",
         "vertical": "CRT Lottes (Port)_V.txt", "adaptive": False,

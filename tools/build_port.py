@@ -52,30 +52,6 @@ SHADERS = {
         "gain": None,
         "mask_strategy": None,
     },
-    "guest_fast": {
-        "module": "guest_fast_ref",
-        "file_base": "CRT Guest Advanced Fast (Port)",
-        "preset_base": "CRT Guest Advanced Fast",
-        "shader_name": "crt-guest-advanced-fast (guest.r)",
-        "source": GUEST_SOURCE,
-        "lut_channels": False,
-        # Upstream's performance rewrite of the identical look: its projection
-        # onto MiSTer's fixed pipeline equals the advanced chain exactly, so
-        # the fitter reproduces the advanced tables under this family's name.
-        "gain": None,
-        "mask_strategy": None,
-    },
-    "guest_fastest": {
-        "module": "guest_fastest_ref",
-        "file_base": "CRT Guest Advanced Fastest (Port)",
-        "preset_base": "CRT Guest Advanced Fastest",
-        "shader_name": "crt-guest-advanced-fastest (guest.r)",
-        "source": GUEST_SOURCE,
-        "lut_channels": False,
-        # Single final pass: no glow lift, no pr_scan, transfer(1.0) == 1.0.
-        "gain": None,
-        "mask_strategy": None,
-    },
     "royale": {
         "module": "royale_ref",
         "file_base": "CRT Royale (Port)",

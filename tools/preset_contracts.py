@@ -29,24 +29,6 @@ FAMILY_SPECS: dict[str, dict[str, str]] = {
         "mask": "CRT Guest Advanced (Port).txt",
         "ifilter": "CRT Guest Advanced (Port)_V No Scanlines.txt",
     },
-    # The fast variant is upstream's performance rewrite of the identical look;
-    # its fixed-pipeline projection equals the advanced one at defaults, so its
-    # tables are numerically identical.  It still ships as a self-contained
-    # family so each preset's stage files can be copied independently.
-    "CRT Guest Advanced Fast": {
-        "file_base": "CRT Guest Advanced Fast (Port)",
-        "vfilter": "CRT Guest Advanced Fast (Port)_V Adaptive.txt",
-        "gamma": "CRT Guest Advanced Fast (Port).txt",
-        "mask": "CRT Guest Advanced Fast (Port).txt",
-        "ifilter": "CRT Guest Advanced Fast (Port)_V No Scanlines.txt",
-    },
-    "CRT Guest Advanced Fastest": {
-        "file_base": "CRT Guest Advanced Fastest (Port)",
-        "vfilter": "CRT Guest Advanced Fastest (Port)_V Adaptive.txt",
-        "gamma": "CRT Guest Advanced Fastest (Port).txt",
-        "mask": "CRT Guest Advanced Fastest (Port).txt",
-        "ifilter": "CRT Guest Advanced Fastest (Port)_V No Scanlines.txt",
-    },
     "CRT Lottes": {
         "file_base": "CRT Lottes (Port)",
         "vfilter": "CRT Lottes (Port)_V.txt",

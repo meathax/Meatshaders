@@ -19,7 +19,7 @@ import preset_contracts  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 failures = []
 counts = {"filter": 0, "gamma": 0, "mask": 0, "preset": 0}
-EXPECTED_COUNTS = {"filter": 20, "gamma": 6, "mask": 7, "preset": 14}
+EXPECTED_COUNTS = {"filter": 14, "gamma": 4, "mask": 5, "preset": 10}
 
 with tempfile.TemporaryDirectory() as tmp:
     for path in sorted(glob.glob(os.path.join(ROOT, "Filters", "*.txt"))):

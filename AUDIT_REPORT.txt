@@ -5,15 +5,13 @@
 
 AUDIT SCOPE
 -----------
-This audit covers exactly seven shader families and fourteen presets: one bare
+This audit covers exactly five shader families and ten presets: one bare
 landscape/default preset and one "- TATE" preset per family. The runtime pack
-contains 20 filters, six gamma LUTs and seven masks. No other preset contract
+contains 14 filters, four gamma LUTs and five masks. No other preset contract
 is part of the release.
 
   CRT Easymode / CRT Easymode - TATE
   CRT Guest Advanced / CRT Guest Advanced - TATE
-  CRT Guest Advanced Fast / CRT Guest Advanced Fast - TATE
-  CRT Guest Advanced Fastest / CRT Guest Advanced Fastest - TATE
   CRT Lottes / CRT Lottes - TATE
   CRT Royale / CRT Royale - TATE
   CRT Royale Kurozumi / CRT Royale Kurozumi - TATE
@@ -51,8 +49,6 @@ Endpoint-inclusive end-to-end RMS is measured through H, V, gamma and mask in
 8-bit output codes over the full periodic target. Lower is closer.
 
   CRT Guest Advanced:       1.237 codes RMS
-  CRT Guest Advanced Fast:  1.237 codes RMS (identical tables; see below)
-  CRT Guest Advanced Fastest: 1.160 codes RMS
   CRT Royale:              18.989 codes RMS
   CRT Royale Kurozumi:     19.854 codes RMS
   CRT Easymode:             3.591 codes RMS
@@ -85,8 +81,6 @@ period.
   Family                    224p -> 1080p    240p -> 1080p
   CRT Easymode                    3.13             5.50
   CRT Guest Advanced              2.69             4.50
-  CRT Guest Advanced Fast         2.69             4.50
-  CRT Guest Advanced Fastest      2.81             5.50
   CRT Lottes                      1.73             3.50
   CRT Royale                      4.14             7.00
   CRT Royale Kurozumi             6.65             6.00
@@ -104,7 +98,7 @@ with the same self-gate.
 Every release build checks:
 
   1. Filter, gamma, mask and preset syntax.
-  2. Exact inventory: 20 filters, 6 gamma LUTs, 7 masks, 14 presets.
+  2. Exact inventory: 14 filters, 4 gamma LUTs, 5 masks, 10 presets.
   3. Exact case-sensitive references from every preset.
   4. Bare-default and TATE axis contracts.
   5. Gamma monotonicity, endpoint coverage, plateau and step behavior.
@@ -154,19 +148,11 @@ target below input code ~58. After the correction and refit, near-black
 -> 2.8), full-range RMS measures 1.237 codes against the corrected target,
 and 240p moire improved from 5.00 to 4.50.
 
-CRT Guest Advanced Fast was verified line by line to project onto MiSTer's
-fixed pipeline identically to CRT Guest Advanced at defaults (same H window
-after tap clamping, same sw0 scanline evaluator, same CGWG mask and
-deconvergence chain; its glow source is a different blur texture with the
-same flat-field value). The fitter consequently reproduces the same
-coefficients under the Fast family's file names; the equivalence is a
-validated contract in tools/targets/guest_fast_ref.py.
-
-CRT Guest Advanced Fastest is a genuinely different response: its single
-final pass has no glow lift, no preserve-scanline (pr_scan) multiply and no
-w3-epsilon dimming, so peak white maps to exactly 255 and the overall
-transfer sits slightly below the advanced one. It receives its own LUT, V
-tables and mask fit (1.160 codes RMS, the closest Guest fit in the pack).
+The release's fast and fastest chains were evaluated during this re-audit
+but are not shipped: the fixed-pipeline projection of the fast chain is
+numerically identical to the advanced one at defaults (nothing to add), and
+the fastest chain's separate look was judged not worth a distinct preset.
+Only the canonical CRT Guest Advanced family ships.
 
 
 ROYALE / KUROZUMI / LOTTES RE-AUDIT 2026-07-21
@@ -223,9 +209,8 @@ KNOWN IRREDUCIBLE DIFFERENCES
 Easymode: nonlinear inner-tap anti-ringing clamp, shader luma-assisted adaptive
 control and automatic arbitrary source-height branching.
 
-Guest Advanced (all three variants): chroma-dependent beam behavior and
-spatial effects beyond one shared max-RGB adaptive scalar; the glow blur's
-spatial spread (absent entirely in Fastest).
+Guest Advanced: chroma-dependent beam behavior and spatial effects beyond one
+shared max-RGB adaptive scalar, including the glow blur's spatial spread.
 
 Royale: nonseparable multi-pass bloom, full 24x24 slot geometry, convergence /+diffusion effects and nonlinear local behavior.
 
@@ -246,8 +231,6 @@ The deterministic model, fitters and validators live in tools/. Source and RTL
 revisions are pinned in SOURCES.txt. Generated families can be rebuilt with:
 
   python tools/build_port.py guest
-  python tools/build_port.py guest_fast
-  python tools/build_port.py guest_fastest
   python tools/build_port.py royale
   python tools/build_port.py kurozumi
   python tools/build_port.py easymode
