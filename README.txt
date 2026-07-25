@@ -1,5 +1,12 @@
+###########################
 CRT shaders for MiSTer FPGA
+###########################
+
 -------
+CRT Lottes
+  Timothy Lottes' shader with soft bloom and a stretched-VGA shadow mask.
+  Warm and glowy; gamma runs through the shader's own curve (LUT off).
+
 CRT Guest Advanced
   guest.r's advanced CRT. Sharp adaptive scanlines with a compact CGWG
   phosphor mask; the all-round best-looking default.
@@ -16,9 +23,6 @@ CRT Easymode
   Clean, bright, low-cost scanline look. Good for a subtle CRT feel that
   stays sharp and readable.
 
-CRT Lottes
-  Timothy Lottes' shader with soft bloom and a stretched-VGA shadow mask.
-  Warm and glowy; gamma runs through the shader's own curve (LUT off).
 
 Each shader preset has a TATE variant
 
