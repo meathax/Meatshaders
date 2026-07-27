@@ -1,5 +1,5 @@
 # Name: CRT Easymode (Port)
-# crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# crt-easymode (Easymode, GPL); libretro/glsl-shaders @ 2b2c5ee3fd8e
 # Gain-split: LUT carries the pre-clip transfer / 1.105; the mask carries 1.105
 # Co-optimized with the adaptive V fit and refined against MiSTer's
 # exact truncating arithmetic; pair with the matching (Port) files

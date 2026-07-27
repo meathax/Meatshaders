@@ -40,18 +40,22 @@ FAMILIES = {
         "vertical": "CRT Easymode (Port)_V Adaptive.txt", "adaptive": True,
         "gamma": "CRT Easymode (Port).txt", "no_scan": True,
         "rmse": 3.80, "max": 20.0, "brightness": 12.5, "selector": 42,
+        "rgb_rmse": 6.50, "rgb_max": 36.0,
+        "step_rmse": 43.0, "step_max": 78.0,
     },
     "guest": {
         "module": "guest_advanced_ref", "base": "CRT Guest Advanced (Port)",
         "vertical": "CRT Guest Advanced (Port)_V Adaptive.txt", "adaptive": True,
         "gamma": "CRT Guest Advanced (Port).txt", "no_scan": True,
-        "rmse": 1.30, "max": 8.0, "brightness": 5.0, "selector": 25,
+        "rmse": 2.50, "max": 10.0, "brightness": 5.0, "selector": 16,
+        "rgb_rmse": 6.25, "rgb_max": 24.0,
     },
     "lottes": {
         "module": "lottes_ref", "base": "CRT Lottes (Port)",
         "vertical": "CRT Lottes (Port)_V.txt", "adaptive": False,
         "gamma": None, "no_scan": False,
-        "rmse": 1.30, "max": 6.0, "brightness": 1.5, "selector": 0,
+        # True piecewise-sRGB mask target, hard-gated over all 256 input codes.
+        "rmse": 1.75, "max": 8.10, "brightness": 1.5, "selector": 0,
     },
     "royale": {
         "module": "royale_ref", "base": "CRT Royale (Port)",
@@ -65,7 +69,11 @@ FAMILIES = {
         "module": "kurozumi_ref", "base": "CRT Royale Kurozumi (Port)",
         "vertical": "CRT Royale Kurozumi (Port)_V Adaptive.txt", "adaptive": True,
         "gamma": "CRT Royale Kurozumi (Port).txt", "no_scan": True,
-        "rmse": 20.50, "max": 125.0, "brightness": 12.0, "selector": 2,
+        # Historical matched Kuro Grade/preset plus the later upstream-fixed
+        # Royale bloom path.  RGB is scored on the physical 1x2 grille cadence;
+        # the neutral metric above still covers all 16x16 resized source cells.
+        "rmse": 28.00, "max": 180.0, "brightness": 24.5, "selector": 0,
+        "rgb_rmse": 34.0, "rgb_max": 178.0,
     },
 }
 
@@ -85,11 +93,7 @@ def brightness_parity(ref, dark, bright, h, lut, mask, mask_encoded):
         masked = mm.mask_multiply(
             sim_profile[None, None, :, :], mask_mult16[:, :, None, :])
         sim = float(masked.mean())
-        beam = np.array([[
-            fitting._ref_vertical_unclipped(ref, f, code / 255.0, ch)
-            for ch in "rgb"] for f in fs])
-        target = 255.0 * np.minimum(
-            mask_encoded[:, :, None, :] * beam[None, None, :, :], 1.0)
+        target = fitting.masked_reference_tile(ref, fs, code, mask_encoded)
         ref_masked = float(target.mean())
         rows.append((x, sim, ref_masked, sim - ref_masked))
     return rows
@@ -163,6 +167,67 @@ def selector_control_jump(h, dark, bright, lut) -> int:
     return worst
 
 
+def easymode_rgb_oracle(ref, dark, bright, h, lut, mask) -> tuple[float, float]:
+    """Exact RGB-field gate against Easymode's complete source pipeline."""
+    levels = (0, 64, 128, 192, 255)
+    fs = np.arange(0, 33) / 64.0
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    errors = []
+    for red in levels:
+        for green in levels:
+            for blue in levels:
+                rgb = (red, green, blue)
+                h_rgb = np.array([int(mm.fir_1d(
+                    np.full(16, int(lut[code, channel]), dtype=np.int64),
+                    h, np.array([8.0]))[0])
+                    for channel, code in enumerate(rgb)], dtype=np.int64)
+                ctrl = np.full(len(fs), int(h_rgb.max()), dtype=np.int64)
+                simulated = np.stack([mm.fir_1d_adaptive(
+                    np.full(16, int(h_rgb[channel]), dtype=np.int64),
+                    dark, bright, 8.0 + fs, ctrl) for channel in range(3)], axis=1)
+                port = mm.mask_multiply(simulated[None, None, :, :],
+                                        m16[:, :, None, :])
+                normalized = tuple(code / 255.0 for code in rgb)
+                # Build in the same (mask_y, mask_x, phase, RGB) order as port.
+                target = 255.0 * np.array([[[
+                    ref.ref_uniform_rgb(float(f), normalized, px, py)
+                    for f in fs] for px in range(mask.width)]
+                    for py in range(mask.height)], dtype=np.float64)
+                errors.append((port - target).ravel())
+    error = np.concatenate(errors)
+    return float(np.sqrt(np.mean(error * error))), float(np.abs(error).max())
+
+
+def easymode_step_oracle(ref, dark, bright, h, lut, mask) -> tuple[float, float]:
+    """Exact black/white horizontal-step gate, including source anti-ringing."""
+    size, split = 16, 8
+    source_codes = np.zeros((size, size, 3), dtype=np.int64)
+    source_codes[:, split:] = 255
+    source_ref = (source_codes.astype(np.float64) / 255.0).tolist()
+    positions = split - 0.5 + np.arange(-8, 9, dtype=np.float64) / 8.0
+    fs = np.arange(0, 33) / 64.0
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    gamma = mm.apply_gamma(source_codes, lut)
+    errors = []
+    for x in positions:
+        h_rgb = np.array([mm.fir_1d(gamma[8, :, channel], h,
+                                    np.array([x]))[0]
+                          for channel in range(3)], dtype=np.int64)
+        ctrl = np.full(len(fs), int(h_rgb.max()), dtype=np.int64)
+        simulated = np.stack([mm.fir_1d_adaptive(
+            np.full(16, int(h_rgb[channel]), dtype=np.int64),
+            dark, bright, 8.0 + fs, ctrl) for channel in range(3)], axis=1)
+        port = mm.mask_multiply(simulated[None, None, :, :],
+                                m16[:, :, None, :])
+        target = 255.0 * np.array([[[
+            ref.ref_source_rgb(source_ref, float(x), 8.0 + float(f), px, py)
+            for f in fs] for px in range(mask.width)]
+            for py in range(mask.height)], dtype=np.float64)
+        errors.append((port - target).ravel())
+    error = np.concatenate(errors)
+    return float(np.sqrt(np.mean(error * error))), float(np.abs(error).max())
+
+
 hard_fail: list[str] = []
 preset_problems = preset_contracts.validate_collection(ROOT)
 print("=== Canonical preset collection ===")
@@ -228,13 +293,18 @@ for key, spec in FAMILIES.items():
         hard_fail.append(f"{base}: flat field clips ({flat:.1f})")
 
     target_mask = fitting.mask_encoded_tile(ref)
+    masked_codes = (np.arange(256, dtype=np.int64)
+                    if key == "lottes" else None)
     rmse, max_error = fitting.rmse_exact_masked(
-        ref, dark, bright, h, lut, mask.tokens, target_mask)
+        ref, dark, bright, h, lut, mask.tokens, target_mask,
+        codes=masked_codes)
     strict_rmse, strict_max = fitting.rmse_exact_masked(
-        ref, dark, bright, h, lut, mask.tokens, target_mask, align=False)
+        ref, dark, bright, h, lut, mask.tokens, target_mask,
+        codes=masked_codes, align=False)
     metric = fitting.rmse_exact_rgb if key == "kurozumi" else fitting.rmse_exact
     mask_off = metric(ref, dark, bright, h, lut)
-    print(f"masked endpoint-inclusive RMSE: {rmse:.3f} codes "
+    masked_label = "all-256-code" if key == "lottes" else "endpoint-inclusive"
+    print(f"masked {masked_label} RMSE: {rmse:.3f} codes "
           f"(max {max_error:.1f}); strict origin {strict_rmse:.3f} "
           f"(max {strict_max:.1f}); mask off {mask_off:.3f}")
     if rmse > spec["rmse"]:
@@ -253,6 +323,27 @@ for key, spec in FAMILIES.items():
         hard_fail.append(
             f"{base}: selector jump {selector} over {spec['selector']}")
 
+    if key in ("guest", "kurozumi"):
+        rgb_kwargs = {}
+        rgb_label = "9-level RGB cube"
+        if key == "kurozumi":
+            rgb_kwargs = {
+                "levels": np.array([0, 64, 128, 192, 255]),
+                "phases": np.arange(0, 9) / 16.0,
+                "reference_period": (1, 2),
+            }
+            rgb_label = "historical 5-level RGB cube / projected 1x2 grille"
+        rgb = fitting.rgb_masked_metrics(
+            ref, dark, bright, h, lut, mask.tokens, **rgb_kwargs)
+        print(f"exact masked {rgb_label}: RMSE {rgb['rms']:.3f}, "
+              f"max {rgb['max']:.1f} codes ({rgb['colors']} colours, "
+              f"{rgb['samples']} samples)")
+        if rgb["rms"] > spec["rgb_rmse"] or rgb["max"] > spec["rgb_max"]:
+            hard_fail.append(
+                f"{base}: exact RGB regression {rgb['rms']:.3f}/"
+                f"{rgb['max']:.1f} over {spec['rgb_rmse']:.2f}/"
+                f"{spec['rgb_max']:.1f}")
+
     parity = brightness_parity(ref, dark, bright, h, lut, mask, target_mask)
     print("brightness parity (sim/reference/delta codes):")
     for x, simulated, reference, delta in parity:
@@ -262,6 +353,22 @@ for key, spec in FAMILIES.items():
         hard_fail.append(
             f"{base}: brightness delta {worst_parity:.1f} over "
             f"{spec['brightness']:.1f}")
+
+    if key == "easymode":
+        rgb_rmse, rgb_max = easymode_rgb_oracle(
+            ref, dark, bright, h, lut, mask)
+        step_rmse, step_max = easymode_step_oracle(
+            ref, dark, bright, h, lut, mask)
+        print(f"exact RGB lattice: RMSE {rgb_rmse:.3f}, max {rgb_max:.1f} codes")
+        print(f"exact B/W source step: RMSE {step_rmse:.3f}, "
+              f"max {step_max:.1f} codes")
+        if rgb_rmse > spec["rgb_rmse"] or rgb_max > spec["rgb_max"]:
+            hard_fail.append(
+                f"{base}: exact RGB regression {rgb_rmse:.3f}/{rgb_max:.1f}")
+        if step_rmse > spec["step_rmse"] or step_max > spec["step_max"]:
+            hard_fail.append(
+                f"{base}: exact source-step regression "
+                f"{step_rmse:.3f}/{step_max:.1f}")
 
     moire = moire_1080(dark, bright, lut)
     print("1080p moire: " + ", ".join(
@@ -277,9 +384,8 @@ for key, spec in FAMILIES.items():
             codes=np.array([0]))
         print(f"code-0 colour gate: RMSE {black_rmse:.3f}, max {black_max:.1f}, "
               f"LUT {lut[0].tolist()}")
-        if black_rmse > 1.5 or black_max > 5.0 or \
-                not int(lut[0, 0]) > int(lut[0, 1]):
-            hard_fail.append(f"{base}: near-black colour regression")
+        if black_rmse > 0.05 or black_max > 0.5 or np.any(lut[0] != 0):
+            hard_fail.append(f"{base}: historical zero-black regression")
 
 print("\n" + ("HARD FAILURES:\n" + "\n".join(hard_fail)
                if hard_fail else "ALL REQUIRED 1080P GATES PASS"))

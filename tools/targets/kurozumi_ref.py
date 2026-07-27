@@ -1,17 +1,28 @@
 """
 kurozumi_ref.py -- Reference implementation of CRT-ROYALE-KUROZUMI (the
-P22/PVM-look preset over crt-royale, by Kurozumi/hunterk) from
-libretro/slang-shaders pinned to commit
-3b0d6aa1d134a168478cd9c904a866d969f8882b (presets/crt-royale-kurozumi.slangp,
-13 passes: grade.slang prepended to the 12 crt-royale passes).
+P22/PVM-look preset over crt-royale, by Kurozumi/hunterk) using the last
+historically matched preset/Grade pair from libretro/slang-shaders:
+
+    preset commit 7f34fc7469ecc7d90e03df45d1a10975136eb712
+    Grade blob    d5d58f8c88369b062e683d3e52c733535d400a85
+
+The same Grade blob and effective parameter set are present at the explicit
+Kurozumi-fix commit 340b533a7c1889c8e18e59bc89dab1867a4116bb.
+The preset is 13 passes: the historical misc/shaders/grade.slang prepended to
+the 12 crt-royale passes.  One deliberate source-corrected hybrid is retained:
+7f34fc's bloom-approx pass calculates its Gaussian result but accidentally
+discards it; this model uses the later upstream-fixed Royale bloom behavior at
+the active source pin 3b0d6aa1d134a168478cd9c904a866d969f8882b.  It therefore
+matches the historical Kuro Grade/preset intent plus the upstream bug fix, not
+the byte-exact visual output of every 7f pass.
 
 Models the KUROZUMI-parameter math for a 240p source displayed at 1920x1080
 (4.5x vertical scale). Pure Python (math only; numpy not required).
 Same interface as royale_ref.py: transfer, beam_weight, ref_vertical,
 h_kernel, mask_spec, notes, defaults.
 
-Effective parameter set (all from the .slangp `parameters` overrides; every
-override is applied to the #pragma parameter uniforms at runtime):
+Effective parameter set (from the .slangp `parameters` overrides that resolve
+to #pragma parameter uniforms at runtime):
 
     crt_gamma = 2.4           lcd_gamma = 2.4         levels_contrast = 0.67
     halation_weight = 0.0037  diffusion_weight = 0.0011
@@ -30,25 +41,22 @@ override is applied to the #pragma parameter uniforms at runtime):
     interlace detect on (240p => progressive)
 
 STRUCTURAL preset differences vs crt-royale.slangp (not just parameters):
-  * Pass 0 is misc/shaders/grade.slang (Dogway).  At this commit grade is the
-    2023 version; MANY of kurozumi's grade overrides target the older 2020
-    grade parameter set (g_gamma_in, g_gamma_type, g_I_SHIFT/g_Q_SHIFT/
-    g_I_MUL/g_Q_MUL, g_satr...) and NO LONGER EXIST -> silently dropped by
-    RetroArch.  The surviving grade overrides: g_signal_type=0 (RGB),
-    g_crtgamut=1 (P22-90s phosphor), g_space_out=-1 (Rec.709 display,
-    pure-power TRC branch), wp_temperature=6504 (D65), g_vignette=0 (OFF),
-    g_lum/g_cntrst/g_sat/g_lift/tints = neutral.  Grade defaults NOT
-    overridden that still act: g_CRT_l=2.50 (EOTF-1886a black level 0.0382),
-    g_CRT_b=50, g_CRT_c=50 (neutral), g_Dark_to_Dim=1 (encode gamma
-    2.4/0.9811), g_CRT_rf=5.0 + g_CRT_sl=34 => additive Flare offset
-    (+0.0167, +0.0149, +0.0047) encoded per channel (warm black lift),
-    g_GCompress=1 (identity on the gray axis).
-    On the GRAY AXIS grade reduces exactly to the per-channel curve
-    grade_transfer() below (gamut/CAT steps are white-preserving; residual
-    < 2e-4 from the white-point polynomial fit is ignored).
+  * Pass 0 is Dogway's historical Grade shader.  The intended overrides are
+    active here: g_gamma_in=2.4, signal=RGB, P22 measured-average phosphors,
+    Rec.709/pure-power output, D65, vignette off, and neutral tone/saturation/
+    tint controls.  g_gamma_out is not overridden and therefore remains the
+    Grade default 2.5.  The preset's g_gamma_type=1 entry is a dead legacy key:
+    blob d5d58f8 does not declare that pragma/uniform, so RetroArch drops it.
+    LUT_Size1/LUT1/LUT_Size2/LUT2 are value-less preset entries and retain the
+    shader defaults 16/0/64/0, leaving both Grade LUTs disabled.
+  * Grade decodes each input component with the 2.4 monitor curve, transforms
+    P22 RGB -> XYZ -> Rec.709 RGB with the source CAT02 white-point adjustment,
+    applies the reverse 2.304 electron-gun curve, and runs the exactly cancelling
+    Rec.709 surround OETF/EOTF pair around neutral controls.  Its RGBA8 output is
+    quantized before Royale linearizes it with crt_gamma=2.4.  Black is zero.
   * Halation blur passes are blur5fast (sigma = 0.9845703125), not blur9fast.
 
-Pipeline gamma: grade outputs encoded (see grade_transfer); royale pass 1
+Pipeline gamma: Grade outputs encoded RGBA8 (see grade_rgb); royale pass 1
 linearizes with pow(x, crt_gamma=2.4); every intermediate FBO is linear light
 (sRGB8 storage, clamps at 1.0); the last pass encodes with
 pow(c, 1/lcd_gamma=2.4).
@@ -62,10 +70,12 @@ Interface (contract for the automated fitting stage):
     notes()             features not representable on MiSTer
     defaults()          dict of all effective parameter values
 Optional `channel` kwarg ('r'/'g'/'b') on transfer/ref_vertical applies that
-channel's grade flare AND vertical convergence offset; default None models a
-neutral centered channel with green flare (recommended fitting target).
+channel's vertical convergence offset; default None models a neutral centered
+channel (recommended shared-filter fitting target).  grade_rgb() and
+ref_vertical_rgb() expose the nonseparable historical P22 color transform.
 """
 
+import functools
 import math
 
 # ----------------------------------------------------------------------------
@@ -114,79 +124,162 @@ BLOOM_APPROX_H = 240.0
 SQRT2 = math.sqrt(2.0)
 
 # ----------------------------------------------------------------------------
-# grade.slang (2023) gray-axis transfer at kurozumi settings
+# Historical grade.slang color transform at Kurozumi's matched settings
 # ----------------------------------------------------------------------------
 
-G_CRT_L = 2.50                   # grade default "CRT Gamma" (not overridden)
-# CRT_l macro: black level derived from the CRT gamma knob:
-GRADE_BL = -(100000.0 * math.log(
-    (72981.0 - 500000.0 / (3.0 * max(2.3, G_CRT_L))) / 9058.0)) / 945461.0
-# = 0.03816808... (bl on a 0..100 white-level scale)
-
-# Flare (surround reflectance): g_CRT_rf = 5.0, g_CRT_sl = 34.0 defaults:
-_FLARE_BASE = 0.01 * (5.0 / 5.0) * (0.049433 * 34.0 - 0.188367)
-GRADE_FLARE = (_FLARE_BASE * (0.459993 / 0.410702),   # +0.016715 R
-               _FLARE_BASE * 1.0,                     # +0.014924 G
-               _FLARE_BASE * (0.129305 / 0.410702))   # +0.004699 B
-
-GRADE_ENCODE_GAMMA = 2.4 / 0.9811   # SPC=-1 pure power TRC x Dark-to-Dim OOTF
+HISTORICAL_COMMIT = "7f34fc7469ecc7d90e03df45d1a10975136eb712"
+EXPLICIT_FIX_COMMIT = "340b533a7c1889c8e18e59bc89dab1867a4116bb"
+GRADE_BLOB = "d5d58f8c88369b062e683d3e52c733535d400a85"
+ROYALE_BLOOM_FIX_COMMIT = "3b0d6aa1d134a168478cd9c904a866d969f8882b"
+GRADE_GAMMA_IN = 2.4
+GRADE_GAMMA_OUT = 2.5             # pragma default; Kurozumi does not override it
+GRADE_GUN_GAMMA = GRADE_GAMMA_IN ** 2.0 / GRADE_GAMMA_OUT  # 2.304
+GRADE_MONCURVE_OFFSET = 0.099
+GRADE_TEMPERATURE = 6504.0
+GRADE_SURROUND = 1.019264
 
 _CH_IDX = {'r': 0, 'g': 1, 'b': 2}
+
+# GLSL matrices written in mathematical row-major form.  The source constructors
+# are column-major; these rows are the actual result of ``matrix * vector``.
+_P22_TO_XYZ = (
+    (0.4665636420249939, 0.3039233088493347, 0.1799621731042862),
+    (0.25661000609397890, 0.66820019483566280, 0.07518967241048813),
+    (0.005832045804709196, 0.105618737637996670, 0.977465748786926300),
+)
+_XYZ_TO_709 = (
+    (3.24081254005432130, -1.53730857372283940, -0.49858659505844116),
+    (-0.969243049621582000, 1.875966310501098600, 0.041555050760507584),
+    (0.055638398975133896, -0.204007431864738460, 1.057129383087158200),
+)
+_RGB709_TO_XYZ = (
+    (0.41241079568862915, 0.35758456587791443, 0.18045382201671600),
+    (0.21264933049678802, 0.71516913175582890, 0.07218152284622192),
+    (0.019331756979227066, 0.119194857776165010, 0.950390160083770800),
+)
+# Actual row-major GLSL matrix for ``vec3 * CAT02`` in wp_adjust().
+_CAT02 = (
+    (0.7328, -0.70360, 0.003),
+    (0.4296, 1.6975, -0.0136),
+    (-0.1624, 0.0061, 0.9834),
+)
 
 
 def _clamp01(v):
     return max(0.0, min(1.0, v))
 
 
-def _grade_eotf_1886a(c):
-    """grade.slang EOTF_1886a with bl=GRADE_BL, brightness=50, contrast=50."""
-    bl = GRADE_BL
-    b = bl ** (1.0 / 2.4)
-    a = 100.0 ** (1.0 / 2.4) - b
-    b = (50.0 - 50.0) / 250.0 + b / a      # brightness 50 -> b/a only
-    a = 1.0                                # contrast == 50 -> 1.0
-    Vc = 0.35
-    Lw = 100.0 / 100.0 * a                 # 1.0
-    Lb = min(b * a, Vc)
-    a1, a2 = 2.6, 3.0
-    k = Lw / (1.0 + Lb) ** a1
-    sl = k * (Vc + Lb) ** (a1 - a2)
-    c = k * (c + Lb) ** a1 if c >= Vc else sl * (c + Lb) ** a2
-    # Black lift compensation:
-    bc = 0.00446395 * bl ** 1.23486
-    c = min(max(c - bc, 0.0) * (1.0 / (1.0 - bc)), 1.0)
-    c = c ** (1.0 - 0.00843283 * bl ** 1.22744)
-    return c
+def _mat_vec(matrix, vector):
+    return tuple(sum(matrix[row][col] * vector[col] for col in range(3))
+                 for row in range(3))
 
 
-def _grade_rolled_gain(c, gain=0.0):
-    """grade.slang rolled_gain at g_lum = 0.0 (negative/zero branch)."""
+def _vec_mat(vector, matrix):
+    return tuple(sum(vector[row] * matrix[row][col] for row in range(3))
+                 for col in range(3))
+
+
+def _moncurve_f(color, gamma, offs):
+    """Historical Grade forward monitor curve, verbatim algebra."""
+    color = _clamp01(color)
+    fs = ((gamma - 1.0) / offs) * (
+        offs * gamma / ((gamma - 1.0) * (1.0 + offs))) ** gamma
+    xb = offs / (gamma - 1.0)
+    return ((color + offs) / (1.0 + offs)) ** gamma if color > xb else color * fs
+
+
+def _moncurve_r(color, gamma, offs):
+    """Historical Grade reverse monitor curve, verbatim algebra."""
+    color = _clamp01(color)
+    yb = (offs * gamma / ((gamma - 1.0) * (1.0 + offs))) ** gamma
+    rs = ((gamma - 1.0) / offs) ** (gamma - 1.0) * (
+        (1.0 + offs) / gamma) ** gamma
+    return ((1.0 + offs) * color ** (1.0 / gamma) - offs
+            if color > yb else color * rs)
+
+
+def _grade_rolled_gain(color, gain=0.0):
+    """Historical rolled_gain; even neutral gain=0 is microscopically nonidentity."""
     gx = abs(gain) + 0.001
     if gain > 0.0:
         anch = 0.5 / (gx / 2.0)
-        return c * ((c - anch) / (1.0 - anch))
-    anch = 0.5 / gx                        # 500.0 at gain 0
-    return c * ((1.0 - anch) / (c - anch)) * (1.0 - gain)
+        return color * ((color - anch) / (1.0 - anch))
+    anch = 0.5 / gx
+    return color * ((1.0 - anch) / (color - anch)) * (1.0 - gain)
+
+
+def _wp_adjust_d65(color):
+    """Historical CAT02 white-point calculation at the preset's 6504 K."""
+    temperature = GRADE_TEMPERATURE
+    temp3 = 1000.0 / temperature
+    temp6 = 1000000.0 / (temperature ** 2.0)
+    temp9 = 1000000000.0 / (temperature ** 3.0)
+    x = (0.244063 + 0.09911 * temp3 + 2.9678 * temp6 - 4.6070 * temp9
+         if temperature <= 7000.0 else
+         0.237040 + 0.24748 * temp3 + 1.9018 * temp6 - 2.0064 * temp9)
+    y = -3.0 * x * x + 2.870 * x - 0.275
+    z = 1.0 - x - y
+    target = _vec_mat((x / y, 1.0, z / y), _CAT02)
+    reference = _vec_mat((0.95045, 1.0, 1.088917), _CAT02)
+    scale = tuple(target[i] / reference[i] for i in range(3))
+    return tuple(color[i] * scale[i] for i in range(3))
+
+
+def _unorm8(color):
+    """Grade pass 0 writes a non-sRGB, non-float RGBA8 framebuffer."""
+    return tuple(math.floor(_clamp01(value) * 255.0 + 0.5) / 255.0
+                 for value in color)
+
+
+def grade_rgb(rgb, quantize=True):
+    """Exact matched-Grade encoded RGB output for one encoded RGB input.
+
+    This transliterates the active source path: monitor-curve decode, measured
+    P22 RGB->XYZ, CAT02 D65 adjustment, XYZ->Rec.709, reverse 2.304 gun curve,
+    neutral surround OETF/control/EOTF path, and pass-0 RGBA8 quantization.
+    The P22 transform is nonseparable; this function is the RGB source oracle.
+    """
+    if len(rgb) != 3:
+        raise ValueError("rgb must have exactly three components")
+    col = tuple(_moncurve_f(_clamp01(float(value)), GRADE_GAMMA_IN,
+                            GRADE_MONCURVE_OFFSET) for value in rgb)
+    xyz = _mat_vec(_P22_TO_XYZ, col)
+    xyz = _wp_adjust_d65(xyz)
+    adj = tuple(_clamp01(value) for value in _mat_vec(_XYZ_TO_709, xyz))
+    adj = tuple(_moncurve_r(value, GRADE_GUN_GAMMA,
+                            GRADE_MONCURVE_OFFSET) for value in adj)
+
+    # SPC=-1 OETF, neutral contrast/controls, then matching EOTF.  These power
+    # branches algebraically cancel, but retaining them preserves clamp/order.
+    oetf = tuple(_clamp01((value ** (1.0 / GRADE_SURROUND)) ** 2.4)
+                 for value in adj)
+    xyz2 = _mat_vec(_RGB709_TO_XYZ, oetf)
+    screen = tuple(max(value, 0.0) for value in _mat_vec(_XYZ_TO_709, xyz2))
+    screen = tuple(_clamp01(_grade_rolled_gain(value, 0.0)) for value in screen)
+    trc = tuple(_clamp01((value ** GRADE_SURROUND) ** (1.0 / 2.4))
+                for value in screen)
+    return _unorm8(trc) if quantize else trc
 
 
 def grade_transfer(x, channel=None):
-    """Gray-axis encoded->encoded transfer of the grade pass at kurozumi
-    settings (signal RGB, gamut/CAT identity on grays, vignette off,
-    contrast/sat/lift neutral).  channel selects the Flare offset
-    (None -> green).  Steps: EOTF-1886a decode -> rolled_gain(0) ->
-    clamp01 -> encode pow(0.9811/2.4) -> + Flare, min 1.0."""
-    x = _clamp01(x)
-    lin = _grade_eotf_1886a(x)
-    lin = _clamp01(_grade_rolled_gain(lin, 0.0))
-    enc = _clamp01(lin ** (1.0 / GRADE_ENCODE_GAMMA))
-    fl = GRADE_FLARE[_CH_IDX.get(channel, 1)]
-    return min(enc + fl, 1.0)
+    """Ideal historical Grade neutral-axis transfer; practical black is 0."""
+    rgb = grade_rgb((_clamp01(x),) * 3)
+    return rgb[_CH_IDX.get(channel, 1)]
 
 
 def lin_input(L, channel=None):
-    """Linear value entering the scanline pass for encoded source level L:
-    grade gray transfer followed by royale's pow(x, crt_gamma=2.4)."""
+    """Linear value entering Royale after the quantized historical Grade pass."""
     return grade_transfer(L, channel) ** CRT_GAMMA
+
+
+@functools.lru_cache(maxsize=4096)
+def _lin_input_rgb_cached(rgb):
+    return tuple(value ** CRT_GAMMA for value in grade_rgb(rgb))
+
+
+def lin_input_rgb(rgb):
+    """Per-channel linear input to Royale for an arbitrary encoded RGB source."""
+    return _lin_input_rgb_cached(tuple(float(value) for value in rgb))
 
 
 # ----------------------------------------------------------------------------
@@ -241,19 +334,18 @@ HALATION_FLAT_GAIN = _blur5_gain() ** 2         # ~0.98600 (flat field)
 
 # BLOOM_APPROX 2D resize Gaussian sigma: mask_triad_size_desired = 1.0 ->
 # mask_num_triads_runtime = max(256, 1418.18/1.0) = 1418.18; NOTE the shader
-# combines with beam_max_sigma_STATIC (user-settings.h) = 0.3, NOT the
-# runtime 0.16:
+# active 4x4 branch combines that resize sigma with the runtime Kurozumi
+# beam_max_sigma override (0.16).  The static 0.3 path is not selected:
 _MAX_VP_X = 1080.0 * 1024.0 * (4.0 / 3.0)
 _EST_VP_X = 1080.0 * (432.0 / 329.0)
 _N_TRIADS = max(256.0, _EST_VP_X / MASK_TRIAD_SIZE_DESIRED)        # 1418.18
 _BA_SIGMA_RESIZE = (_min_sigma_to_blur_triad(_MAX_VP_X / _N_TRIADS)
                     * BLOOM_APPROX_W / _MAX_VP_X)                  # ~0.12129
-BEAM_MAX_SIGMA_STATIC = 0.3
-BLOOM_APPROX_SIGMA = math.hypot(_BA_SIGMA_RESIZE, BEAM_MAX_SIGMA_STATIC)
-# ~0.32360
+BLOOM_APPROX_SIGMA = math.hypot(_BA_SIGMA_RESIZE, BEAM_MAX_SIGMA)
+# ~0.20075
 
 # Total diffusion/halation blur sigma in BLOOM_APPROX pixels:
-_DIFF_SIGMA_BA = math.hypot(BLOOM_APPROX_SIGMA, BLUR5_STD_DEV)     # ~1.0364
+_DIFF_SIGMA_BA = math.hypot(BLOOM_APPROX_SIGMA, BLUR5_STD_DEV)     # ~1.0048
 DIFFUSION_SIGMA_SRC_X = _DIFF_SIGMA_BA * SRC_WIDTH / BLOOM_APPROX_W
 DIFFUSION_SIGMA_SRC_Y = _DIFF_SIGMA_BA
 
@@ -290,7 +382,7 @@ def beam_weight(d, L):
     L in [0,1].  The line's linear value is E = lin_input(L) =
     grade_transfer(L)^2.4 and its light contribution is E * beam_weight(d, L).
     Per-channel: sigma/beta come from that channel's own linear value; this is
-    the scalar (gray, green-flare) form, convergence offsets NOT applied."""
+    the scalar neutral green-component form, convergence offsets NOT applied."""
     E = lin_input(_clamp01(L))
     return _beam_profile(abs(d), E)
 
@@ -379,7 +471,7 @@ def ref_vertical(f, x, channel=None):
     (f=0 = scanline grid position, f=0.5 = midway between lines) for a uniform
     encoded input x, MASK DISABLED, kurozumi parameters, 240p at 1080p.
 
-    Chain: grade (gray-axis curve + flare) -> linearize (2.4) -> 3-scanline
+    Chain: historical Grade neutral curve -> linearize (2.4) -> 3-scanline
     generalized-Gaussian beam sum (sigma 0.02..0.16) -> autodim 0.5 + FBO
     clamp -> halation lerp (0.37% toward flat E*0.98600) -> [mask=1] ->
     brightpass (underest 0.68, cw 0.3902) / 17-tap bloom blur (sigma 1.0234)
@@ -387,9 +479,9 @@ def ref_vertical(f, x, channel=None):
     -> diffusion lerp (0.11% toward 0.67*E*0.98600) -> FBO clamp
     -> encode pow(1/2.4).
 
-    channel='r'/'g'/'b' applies that channel's grade flare and vertical
+    channel='r'/'g'/'b' applies that channel's Grade transform and vertical
     convergence offset (r +0.05, g -0.05, b +0.05 scanlines); None models a
-    neutral centered channel with green flare."""
+    neutral centered channel using the green component."""
     x = _clamp01(x)
     f = abs(f) % 1.0
     conv_y = CONVERGENCE_Y[_CH_IDX[channel]] if channel in _CH_IDX else 0.0
@@ -406,17 +498,126 @@ def ref_vertical(f, x, channel=None):
     return final ** (1.0 / LCD_GAMMA)
 
 
+def _electron_intensity_rgb(f, energies, convergence=True):
+    """Vector form of the scanline + source-accurate desaturating halation."""
+    conv = CONVERGENCE_Y if convergence else (0.0, 0.0, 0.0)
+    scan_dim = tuple(_clamp01(
+        LEVELS_AUTODIM_TEMP * _scanline_sum(f, energies[i], conv[i]))
+        for i in range(3))
+    halation_scalar = (LEVELS_AUTODIM_TEMP * HALATION_FLAT_GAIN
+                       * sum(energies) / 3.0)
+    return tuple(_clamp01(scan_dim[i] +
+                          (halation_scalar - scan_dim[i]) * HALATION_WEIGHT)
+                 for i in range(3))
+
+
+def _masked_brightpass_rgb(f, energies, raw_mask, mask_amplify,
+                           convergence=True):
+    electron = _electron_intensity_rgb(f, energies, convergence)
+    intensity_dim = tuple(_clamp01(electron[i] * raw_mask[i]) for i in range(3))
+    bright = tuple(_brightpass(intensity_dim[i], energies[i], mask_amplify)
+                   for i in range(3))
+    return intensity_dim, bright
+
+
+def _blurred_brightpass_rgb(f, energies, raw_mask, mask_amplify,
+                            convergence=True):
+    """Local-cell 17-tap bloom projection for a uniform source field.
+
+    Vertical neighbors are exact for the supplied mask cell.  The real shader's
+    horizontal bloom also integrates adjacent two-pixel grille cells; the API's
+    point mask multiplier cannot express that nonlocal dependency, so this is
+    the closest deterministic per-cell projection available to the MiSTer fit.
+    """
+    center = _masked_brightpass_rgb(
+        f, energies, raw_mask, mask_amplify, convergence)[1]
+    total = [_BLOOM_W[0] * center[i] for i in range(3)]
+    for k in range(1, 9):
+        for sign in (-1.0, 1.0):
+            phase = (f + sign * k * SCAN_PER_OUT_PX) % 1.0
+            sample = _masked_brightpass_rgb(
+                phase, energies, raw_mask, mask_amplify, convergence)[1]
+            for i in range(3):
+                total[i] += _BLOOM_W[k] * sample[i]
+    h_gain = ((1.0 + 2.0 * sum(
+        math.exp(-(j * j) * 0.5 / (BLOOM_SIGMA ** 2)) for j in range(1, 9)))
+        * _fast_gaussian_weight_sum_inv(BLOOM_SIGMA))
+    return tuple(value * h_gain for value in total)
+
+
+@functools.lru_cache(maxsize=262144)
+def _ref_vertical_rgb_cached(f, rgb, mask_mult):
+    """Cached tuple-only implementation for :func:`ref_vertical_rgb`."""
+    energies = lin_input_rgb(rgb)
+    if mask_mult is None:
+        raw_mask = (1.0, 1.0, 1.0)
+        mask_amplify = MASK_AMPLIFY_DISABLED
+    else:
+        raw_mask = tuple(max(0.0, value) / MASK_AMPLIFY
+                         for value in mask_mult)
+        mask_amplify = MASK_AMPLIFY
+    intensity_dim, brightpass = _masked_brightpass_rgb(
+        f, energies, raw_mask, mask_amplify, convergence=True)
+    blurred = _blurred_brightpass_rgb(
+        f, energies, raw_mask, mask_amplify, convergence=True)
+    result = []
+    for i in range(3):
+        phosphor = ((intensity_dim[i] - brightpass[i] + blurred[i])
+                    * mask_amplify * (1.0 / LEVELS_AUTODIM_TEMP)
+                    * LEVELS_CONTRAST)
+        diffusion = LEVELS_CONTRAST * energies[i] * HALATION_FLAT_GAIN
+        final = _clamp01(phosphor * (1.0 - DIFFUSION_WEIGHT)
+                         + diffusion * DIFFUSION_WEIGHT)
+        result.append(final ** (1.0 / LCD_GAMMA))
+    return tuple(result)
+
+
+def ref_vertical_rgb(f, rgb, mask_mult=None):
+    """Uniform-field RGB oracle through historical Grade and CRT-Royale.
+
+    ``rgb`` is encoded source RGB.  With ``mask_mult=None`` the phosphor mask is
+    disabled and mask amplification is one, matching the filter fit.  A supplied
+    multiplier is the net linear tile returned by mask_spec(); it is split back
+    into Royale's raw mask sample and later reconstitution amplification so the
+    source clamp/order is retained.
+    """
+    if len(rgb) != 3:
+        raise ValueError("rgb must have exactly three components")
+    f = abs(float(f)) % 1.0
+    rgb = tuple(_clamp01(float(value)) for value in rgb)
+    if mask_mult is None:
+        mask_mult = None
+    else:
+        if len(mask_mult) != 3:
+            raise ValueError("mask_mult must have exactly three components")
+        mask_mult = tuple(float(value) for value in mask_mult)
+    return _ref_vertical_rgb_cached(f, rgb, mask_mult)
+
+
+@functools.lru_cache(maxsize=262144)
+def _ref_masked_cached(f, x, red, green, blue, index):
+    pixel = (red, green, blue)
+    net = tuple(value / 255.0 * MASK_AMPLIFY for value in pixel)
+    return ref_vertical_rgb(f, (_clamp01(x),) * 3, net)[index]
+
+
+def ref_masked(f, x, px, py, channel):
+    """Exact local-order neutral mask hook used by the periodic fitter."""
+    index = _CH_IDX[channel]
+    pixel = MASK_TILE[int(py) % len(MASK_TILE)][int(px) % len(MASK_TILE[0])]
+    return _ref_masked_cached(float(f), float(x), *pixel, index)
+
+
 def transfer(x, channel=None):
     """End-to-end encoded->encoded transfer for a uniform field sampled at
     f=0 (scanline grid position), mask disabled.  Includes the grade pass
-    (EOTF-1886a + flare), CRT gamma 2.4, beam peak gain, halation, contrast
+    (historical P22 Grade), CRT gamma 2.4, beam peak gain, halation, contrast
     0.67, bloom redistribution, diffusion, FBO clipping, and LCD gamma 1/2.4.
     NOTE: this is the SCANLINE-PEAK transfer; the thin beam concentrates the
     line energy, so the peak saturates at 1.0 from x ~0.738 (reconstitute
     clamp; the scanline-FBO peak clamp starts at x ~0.878).  The 0.67
     contrast ceiling applies to the flat-field SPATIAL AVERAGE (0.67 linear
-    = 0.846 encoded), not the peak.  Encoded black is ~0.026 (grade flare
-    black lift)."""
+    = 0.846 encoded), not the peak.  Encoded black is exactly zero."""
     return ref_vertical(0.0, x, channel)
 
 
@@ -430,8 +631,8 @@ def h_kernel(frac):
         sigma = 0.32 source px, taps at distances (1+frac, frac, 1-frac,
         2-frac), weights exp(-d^2/(2 sigma^2)) normalized to sum 1, applied
         in LINEAR light (beam_horiz_linear_rgb_weight = 1.0).
-      * 0.11% diffusion: Gaussian sigma ~0.829 source px (BLOOM_APPROX 4x4
-        resize sigma 0.3236 (+) blur5 sigma 0.9846, at 320->256 scale),
+      * 0.11% diffusion: Gaussian sigma ~0.8039 source px (BLOOM_APPROX 4x4
+        resize sigma ~0.20075 (+) blur5 sigma 0.9846, at 320->256 scale),
         discretized on the source grid, normalized.
 
     The Gaussian 4-tap IS a 4-tap FIR: it maps to MiSTer's horizontal
@@ -477,8 +678,8 @@ def mask_spec():
 
     Applied in LINEAR light; net multiplier = (tile/255) * mask_amplify
     (255/53 = 4.8113).  Net linear multipliers: bright phase ~1.90, dim
-    phase ~0.264, green ~1.019 flat; average 1.064.  Encoded (^(1/2.2)):
-    bright 1.341, dim 0.546, green 1.009."""
+    phase ~0.264, green ~1.019 flat; average 1.064.  Encoded (^(1/2.4)):
+    bright ~1.309, dim ~0.575, green ~1.008."""
     avg = sum(sum(sum(px) for px in row) for row in MASK_TILE) / (16 * 16 * 3 * 255.0)
     peak = max(max(max(px) for px in row) for row in MASK_TILE) / 255.0
     return {
@@ -500,14 +701,19 @@ def mask_spec():
         "tile_linear_multiplier_note":
             "per-pixel LINEAR multiplier = tile_rgb_0_255/255 * mask_amplify "
             "(4.8113); for MiSTer's encoded-domain mask stage use "
-            "(linear_mult)^(1/2.2).  Representative encoded triple per pixel: "
-            "bright phase (1.341, 1.009, 0.546), dim phase mirrored in R/B.",
+            "(linear_mult)^(1/2.4).  Representative encoded triple per pixel: "
+            "bright phase (~1.309, ~1.008, ~0.575), dim phase mirrored in R/B.",
     }
 
 
 def defaults():
     return {
-        "commit": "3b0d6aa1d134a168478cd9c904a866d969f8882b",
+        "commit": HISTORICAL_COMMIT,
+        "explicit_fix_commit": EXPLICIT_FIX_COMMIT,
+        "grade_blob": GRADE_BLOB,
+        "royale_bloom_fix_commit": ROYALE_BLOOM_FIX_COMMIT,
+        "source_hybrid": "historical Kuro preset+Grade with later upstream-fixed "
+                         "Royale bloom-approx output",
         "preset": "presets/crt-royale-kurozumi.slangp",
         "crt_gamma": CRT_GAMMA, "lcd_gamma": LCD_GAMMA,
         "levels_contrast": LEVELS_CONTRAST,
@@ -536,14 +742,18 @@ def defaults():
         "geom_mode": "off (0.0)", "border_darkness": 0.0,
         "interlacing": "auto-detect; 240p is progressive",
         "grade": {
-            "version_note": "2023 grade; kurozumi's 2020-era grade overrides "
-                            "(g_gamma_in, g_gamma_type, IQ knobs) are dropped",
-            "g_signal_type": 0.0, "g_crtgamut": "P22-90s (1.0)",
+            "version_note": "historically matched Grade blob; active original "
+                            "Kurozumi parameter family",
+            "g_gamma_in": GRADE_GAMMA_IN,
+            "g_gamma_out_default": GRADE_GAMMA_OUT,
+            "gun_curve_gamma": GRADE_GUN_GAMMA,
+            "g_signal_type": 0.0,
+            "g_crtgamut": "P22 measured average (1.0)",
             "g_space_out": "Rec.709 / pure power (-1.0)",
-            "wp_temperature": 6504.0, "g_vignette": 0.0,
-            "g_CRT_l": G_CRT_L, "grade_black_level": GRADE_BL,
-            "grade_encode_gamma": GRADE_ENCODE_GAMMA,
-            "grade_flare_rgb": GRADE_FLARE,
+            "wp_temperature": GRADE_TEMPERATURE,
+            "g_vignette": 0.0,
+            "pass0_storage": "RGBA8 UNORM",
+            "black": 0.0,
         },
         "bloom_sigma_at_triad2": BLOOM_SIGMA,
         "bloom_center_weight": CENTER_WEIGHT,
@@ -557,15 +767,20 @@ def defaults():
 
 def notes():
     return [
-        "GRADE PASS: prepended misc/shaders/grade.slang.  On the gray axis it "
-        "is a fixed per-channel monotone curve (EOTF-1886a bl=0.0382 decode, "
-        "re-encode gamma 2.4/0.9811) plus an ADDITIVE per-channel flare "
-        "(+0.0167 R, +0.0149 G, +0.0047 B encoded -> warm black lift).  This "
-        "folds EXACTLY into MiSTer's 3-channel 256-entry gamma LUT (compose "
-        "grade_transfer with the fitted royale-side curve per channel).  Its "
-        "COLOR part (P22-90s->709 gamut matrix + CAT16) is a 3x3 matrix in "
-        "linear light -- NOT representable in MiSTer's scaler (pointwise LUT "
-        "only); off-gray colors shift slightly (identity on the gray axis).",
+        "GRADE PASS: prepended historical misc/shaders/grade.slang blob "
+        "d5d58f8c8836.  It decodes the embedded 2.4 monitor curve, applies the "
+        "measured-average P22 RGB->XYZ->Rec.709 matrix with CAT02 D65 mapping, "
+        "then the reverse 2.304 gun curve and neutral surround path.  Pass 0 "
+        "is RGBA8 UNORM, modeled by grade_rgb().  The source's all-zero path "
+        "contains undefined 0/0 and atan(0,0) intermediates; zero is the "
+        "intended and practical finite GPU result used by this oracle.  The "
+        "P22 3x3 transform is NOT representable by MiSTer's independent 1-D "
+        "RGB LUTs; ref_vertical_rgb() exposes the true vector target so the "
+        "best legal diagonal compromise can be measured rather than hidden.",
+        "DELIBERATE UPSTREAM-FIX HYBRID: 7f34fc's bloom-approx pass computes "
+        "the Gaussian color but discards it.  This reference retains the later "
+        "upstream-corrected Royale bloom output from 3b0d6aa, reproducing the "
+        "intended effect rather than that historical implementation bug.",
         "CONTRAST CEILING: levels_contrast = 0.67 caps flat-field linear "
         "output at 0.67 (encoded 0.67^(1/2.4) = 0.846).  On MiSTer bake the "
         "ceiling into the gamma LUT (max entry ~216/255), NOT into the "
@@ -596,8 +811,8 @@ def notes():
         "MASK AT 1080p IS DEGENERATE: requested 1.0-px triads clamp to 2.0 "
         "px; the shader's own Lanczos resize collapses the grille to a "
         "2-px-period R/B-alternating pattern with spatially FLAT green "
-        "(see mask_spec).  Required encoded per-pixel triple ~ (1.341, "
-        "1.009, 0.546) / mirrored.  MiSTer v2 tokens give one boosted "
+        "(see mask_spec).  Required encoded per-pixel triple ~ (1.309, "
+        "1.008, 0.575) / mirrored.  MiSTer v2 tokens give one boosted "
         "channel (16+Y)/16 and ONE shared Z/16 for the other two -> the "
         "triple is NOT exactly representable (G needs ~1.01 while B needs "
         "~0.55).  Closest options: [a] preserve luma: sel R Y=5 (1.3125), "
@@ -608,7 +823,7 @@ def notes():
         "at 1080p+4K-2x the real preset's mask is already nearly invisible. "
         "Recommend [a] or [c].",
         "MASK PUNCH vs MiSTer CEILING: kurozumi's peak net linear multiplier "
-        "is only 1.906 (encoded 1.341 < MiSTer's 1.9375 ceiling) because the "
+        "is only 1.906 (encoded ~1.309 < MiSTer's 1.9375 ceiling) because the "
         "2-px resize dilutes the grille; the '170%+' punch of the full-res "
         "grille (peak ~4.8 linear, 2.04 encoded) would exceed the ceiling, "
         "but that geometry never renders at 1080p.",
@@ -622,30 +837,33 @@ def notes():
         "mixed post-mask.  At these weights they only add a ~0.5% flat veil "
         "-- fold the DC into the gamma LUT / V-filter HI set; the spatial "
         "spread is below MiSTer's representability threshold and below "
-        "visibility.  (Halation also desaturates -- mean(RGB) -- ignored at "
-        "0.37%.)",
+        "visibility.  ref_vertical_rgb() retains halation's source-accurate "
+        "mean(RGB) desaturation.",
         "CONVERGENCE: x = (-0.05, 0, 0) texels, y = (+0.05, -0.05, +0.05) "
         "scanlines.  MiSTer's H FIR and V FIR are shared across channels -> "
         "per-channel offsets are NOT representable.  Magnitude: 0.05 src px "
         "= 0.375 output px H (at 7.5x for 256-wide), 0.05 lines = 0.225 "
         "output px V -- subpixel; visible only as a faint red fringe. Omit.",
-        "GAMMA: crt 2.4 / lcd 2.4 cancel on the DC transfer EXCEPT for the "
-        "clamps and the grade curve in between; the end-to-end transfer() is "
-        "close to grade_transfer scaled by 0.67^(1/2.4) with beam-clip "
-        "saturation above x~0.92.  Fit the MiSTer gamma LUT to transfer() "
-        "per channel (r/g/b flare variants), and the V filter to "
-        "ref_vertical/transfer ratios.",
+        "GAMMA: crt 2.4 / lcd 2.4 cancel on the DC transfer EXCEPT for clamps "
+        "and the historical Grade curve.  Fit the neutral curve without "
+        "inventing a black lift, then test primaries/secondaries through the "
+        "shared max-RGB adaptive control and retain only a measured RGB/neutral "
+        "Pareto improvement.",
         "INTERLACING: 240p progressive; 288<lines<=576 would bob (not "
         "expressible on MiSTer).  interlace_1080i off.",
         "PER-CHANNEL BEAM WIDTH: as in royale, sigma/beta are per-channel "
         "from each channel's linear value; MiSTer's single max-RGB adaptive "
         "control loses this on saturated colors.",
-        "NOT MODELED: 8-bit sRGB FBO quantization between passes (and the "
-        "RGBA8 UNORM grade FBO); exact math.gamma instead of the shader's "
+        "NOT MODELED: 8-bit sRGB FBO quantization between Royale passes; the "
+        "RGBA8 UNORM Grade FBO IS modeled.  The oracle uses Python double "
+        "precision: it agrees on the complete neutral code axis and fitting "
+        "cube, while rare float32 boundary cases can differ by one UNORM8 "
+        "code.  Uses math.gamma instead of the shader's "
         "gamma approximation (rel err ~5e-4); BLOOM_APPROX texel-grid "
-        "alignment idealized (affects only the 0.48% veil); wp_adjust "
-        "white-point polynomial residual (<2e-4) treated as exact identity "
-        "on grays.",
+        "alignment idealized (affects only the 0.48% veil).  Horizontal bloom "
+        "between neighboring 2-pixel mask cells is approximated by the local "
+        "cell in ref_vertical_rgb(); neutral mask-period validation still "
+        "covers every real 16x16 source cell.",
     ]
 
 

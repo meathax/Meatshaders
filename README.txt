@@ -1,58 +1,43 @@
-====================================================================
- CRT SHADER PORTS FOR MiSTer - CANONICAL 1080p EDITION
-====================================================================
+CRT SHADER PRESETS FOR MiSTer
+=============================
 
-Fixed-pipeline ports of five CRT shaders for MiSTer's HDMI scaler. Each
-family has two presets: the bare family name (landscape) and its "- TATE"
-portrait form.
+Five source-faithful CRT shader presets optimized for MiSTer at 1080p.
+Every preset also includes a "- TATE" version for vertically rotated games.
 
 
-INSTALL
+PRESETS
 -------
-Copy each directory's contents to the matching directory on the MiSTer SD
-card:
+
+CRT Guest Advanced
+  A balanced all-purpose CRT look with sharp scanlines, natural glow and a
+  compact phosphor mask.
+
+CRT Royale
+  A rich, detailed CRT with strong scanlines, bloom and an authentic slot-mask
+  phosphor pattern.
+
+CRT Royale Kurozumi
+  A professional-video-monitor style preset with accurate P22 color, deep
+  blacks, thin scanlines and an aperture-grille mask.
+
+CRT Easymode
+  A clean and bright CRT effect with subtle scanlines that keeps games sharp
+  and easy to read.
+
+CRT Lottes
+  A softer, warmer CRT look with glow, bloom and a classic stretched-VGA
+  shadow mask.
+
+
+INSTALLATION
+------------
+
+Copy the contents of each folder to the matching folder on the MiSTer SD card:
 
   Filters/*       -> /media/fat/Filters/
   Gamma/*         -> /media/fat/Gamma/
   Shadow_Masks/*  -> /media/fat/Shadow_Masks/
   Presets/*       -> /media/fat/Presets/
 
-Then in the MiSTer OSD: Video Processing -> Load preset, and pick the shader.
-
-Requires 1920x1080 HDMI output with the TV set to 1:1 / Just Scan (no
-overscan, no display-side scaling) and MiSTer mask mode 1x. All families
-except Lottes need the v7 adaptive-filter cores.
-
-
-SHADERS
--------
-CRT Guest Advanced
-  guest.r's advanced CRT. Sharp adaptive scanlines with a compact CGWG
-  phosphor mask; the all-round best-looking default.
-
-CRT Royale
-  TroggleMonkey's Royale with its slot-mask phosphor structure and
-  brightness-dependent bloom. Rich, deep, mask-heavy look.
-
-CRT Royale Kurozumi
-  Kurozumi's P22/PVM grade over Royale: warm professional-monitor color,
-  thin bright scanlines, aperture-grille mask.
-
-CRT Easymode
-  Clean, bright, low-cost scanline look. Good for a subtle CRT feel that
-  stays sharp and readable.
-
-CRT Lottes
-  Timothy Lottes' shader with soft bloom and a stretched-VGA shadow mask.
-  Warm and glowy; gamma runs through the shader's own curve (LUT off).
-
-
-NOTES
------
-These are fixed-pipeline approximations, not the original GPU shaders:
-MiSTer's scaler has no programmable shading, so wide/nonseparable blurs,
-curvature and per-channel effects are approximated or omitted. Each file is
-the closest measured mapping for a real 1920x1080 output grid.
-
-For measured accuracy figures see AUDIT_REPORT.txt; for sources and licenses
-see SOURCES.txt.
+On MiSTer, open Video Processing, select Load Preset, and choose the preset
+you want to use.

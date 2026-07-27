@@ -421,6 +421,11 @@ def audit_family(family: LoadedFamily) -> tuple[dict, list[str], list[str]]:
         if np.isfinite(value) and value > limit:
             reports.append(
                 f"{family.spec.key}: {name} {value:.3f} > report ceiling {limit:.3f}")
+    if (family.spec.key == "guest"
+            and selector_worst > REPORT_LIMITS["selector_control_jump"]):
+        hard.append(
+            f"guest: selector_control_jump {selector_worst:.3f} > hard ceiling "
+            f"{REPORT_LIMITS['selector_control_jump']:.3f}")
 
     # Model outputs are clamped by construction, but keeping these checks here
     # catches accidental bypasses or dtype regressions in this validator.

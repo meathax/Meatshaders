@@ -187,7 +187,7 @@ def beam_weight(d, L):
 # Scanline modulation (lines 243-263)
 # ----------------------------------------------------------------------------
 
-def scan_weight_at(f):
+def scan_weight_at(f, input_size_y=INPUT_SIZE_Y):
     """scan_weight = 1 - pow(cos(vTexCoord.y*2*PI*SourceSize.y)*0.5+0.5, 1.5).
 
     With f = vertical fraction from the beam CENTRE (= texel centre), we have
@@ -195,7 +195,7 @@ def scan_weight_at(f):
         cos(2*PI*(n+0.5+f)) = -cos(2*PI*f)
     and the cosine term becomes 0.5*(1 - cos(2*PI*f)):  0 at f=0 (peak,
     scan_weight=1), 1 at f=0.5 (trough, scan_weight=0)."""
-    if not SCANLINES_ENABLED:
+    if float(input_size_y) >= SCANLINE_CUTOFF:
         return 1.0
     c = 0.5 * (1.0 - math.cos(2.0 * PI * f))
     return 1.0 - (c ** SCANLINE_BEAM_WIDTH_MIN) * SCANLINE_STRENGTH
@@ -305,6 +305,96 @@ def h_kernel(frac):
         co.append(2.0 * math.sin(c) * math.sin(c * 0.5) / (c * c))
     s = sum(co)
     return [(float(o), w / s) for o, w in zip(offs, co)]
+
+
+# -- exact RGB/source oracle --------------------------------------------------
+
+def _mask_rgb(px):
+    """Exact default linear-light aperture-grille multiplier at output x."""
+    dark = 1.0 - MASK_STRENGTH
+    lit = int(px) % 3
+    return tuple(1.0 if channel == lit else dark for channel in range(3))
+
+
+def _lanczos_rgb(row, frac):
+    """filter_lanczos() including its per-channel inner-tap anti-ring clamp."""
+    if len(row) != 4 or any(len(pixel) != 3 for pixel in row):
+        raise ValueError("row must be four RGB samples")
+    weights = [weight for _, weight in h_kernel(frac)]
+    filtered = [sum(weights[tap] * float(row[tap][channel])
+                    for tap in range(4)) for channel in range(3)]
+    return tuple(_clamp(filtered[channel],
+                        min(float(row[1][channel]), float(row[2][channel])),
+                        max(float(row[1][channel]), float(row[2][channel])))
+                 for channel in range(3))
+
+
+def ref_rgb_samples(rows, frac_x, frac_y, px=0, py=0,
+                    input_size_y=INPUT_SIZE_Y, masked=True):
+    """Exact shader result for the two-by-four source neighbourhood.
+
+    ``rows`` contains two rows of four normalized encoded RGB samples.  Fetch
+    dilation, nonlinear Lanczos clamping, vertical half-circle interpolation,
+    Rec.709/max-RGB brightness, scanline floor, linear mask, output gamma,
+    boost, and framebuffer clipping are all evaluated in source order.
+    ``py`` is accepted for a common mask-oracle signature; Easymode's default
+    aperture grille has no vertical dependence.
+    """
+    if len(rows) != 2:
+        raise ValueError("rows must contain the current and next source row")
+    squared = [[tuple(_clamp01(float(channel)) ** FETCH_GAMMA
+                      for channel in pixel) for pixel in row] for row in rows]
+    upper = _lanczos_rgb(squared[0], frac_x)
+    lower = _lanczos_rgb(squared[1], frac_x)
+    mix_y = curve_distance(float(frac_y) % 1.0, SHARPNESS_V)
+    linear = [((1.0 - mix_y) * upper[channel] + mix_y * lower[channel])
+              ** POST_FILTER_POW for channel in range(3)]
+    luma = sum(LUMA_W[channel] * linear[channel] for channel in range(3))
+    bright = 0.5 * (max(linear) + luma)
+    scan_bright = _clamp(bright, SCANLINE_BRIGHT_MIN, SCANLINE_BRIGHT_MAX)
+    sw = scan_weight_at(float(frac_y) % 1.0, input_size_y)
+    scan = scan_bright + (1.0 - scan_bright) * sw
+    multiplier = _mask_rgb(px) if masked else (1.0, 1.0, 1.0)
+    return tuple(_clamp01((linear[channel] * scan * multiplier[channel])
+                          ** OUT_POW * BRIGHT_BOOST)
+                 for channel in range(3))
+
+
+def ref_uniform_rgb(f, rgb, px=0, py=0, input_size_y=INPUT_SIZE_Y,
+                    masked=True):
+    """Exact final RGB for a uniform normalized source field."""
+    pixel = tuple(float(channel) for channel in rgb)
+    return ref_rgb_samples([[pixel] * 4, [pixel] * 4], 0.0, f, px, py,
+                           input_size_y, masked)
+
+
+def ref_source_rgb(source, x, y, px=0, py=0, input_size_y=None, masked=True):
+    """Exact shader oracle for an arbitrary normalized RGB source image.
+
+    ``x`` and ``y`` use source-texel-centre coordinates (integer positions are
+    texel centres), matching MiSTer's FIR-model convention.  Edge fetches clamp
+    to the source image, as the shader's source texture does.
+    """
+    height = len(source)
+    width = len(source[0]) if height else 0
+    if height == 0 or width == 0 or any(len(row) != width for row in source):
+        raise ValueError("source must be a non-empty rectangular RGB image")
+    ix, iy = math.floor(float(x)), math.floor(float(y))
+    frac_x, frac_y = float(x) - ix, float(y) - iy
+
+    def fetch(sx, sy):
+        sx = max(0, min(width - 1, int(sx)))
+        sy = max(0, min(height - 1, int(sy)))
+        pixel = source[sy][sx]
+        if len(pixel) != 3:
+            raise ValueError("source pixels must contain RGB triples")
+        return tuple(float(channel) for channel in pixel)
+
+    rows = [[fetch(ix + offset, iy + row)
+             for offset in (-1, 0, 1, 2)] for row in (0, 1)]
+    return ref_rgb_samples(rows, frac_x, frac_y, px, py,
+                           height if input_size_y is None else input_size_y,
+                           masked)
 
 
 def mask_spec():

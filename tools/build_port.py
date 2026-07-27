@@ -1,10 +1,11 @@
 """Build one canonical 1080p MiSTer shader preset pair.
 
-Usage: py -3 build_port.py <guest|royale|kurozumi|easymode>
+Usage: py -3 build_port.py <guest|royale|kurozumi|easymode|lottes>
 
 Emits only the runtime assets used by ``<shader>.ini`` and
 ``<shader> - TATE.ini``: H, adaptive V, interlace-safe V, one gamma LUT, one
-1080p mask, and the two presets.  Prints fitting/moire diagnostics;
+1080p mask, and the two presets (Lottes uses its source-faithful fixed V and
+identity gamma).  Prints fitting/moire diagnostics;
 validate_port.py performs the full acceptance run.
 """
 
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fileio
 import fitting
 import mister_model as mm
+import quantize
 from fitting import rmse_exact
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,10 +36,10 @@ if not os.path.isdir(TARGETS):
 sys.path.insert(0, TARGETS)
 
 COMMIT = "3b0d6aa1d134a168478cd9c904a866d969f8882b"
-# The three Guest families are built from guest.r's upstream release drop,
-# which supersedes the libretro pin for them (verified identical at defaults
-# for the advanced chain; see tools/targets/guest_*_ref.py provenance).
-GUEST_SOURCE = "crt-guest-advanced-2026-07-12-release1"
+# Guest Advanced is built from guest.r's upstream release drop, which
+# supersedes the libretro pin for this family; see its reference provenance for
+# the one temporal afterglow delta outside MiSTer's static spatial pipeline.
+GUEST_SOURCE = "crt-guest-advanced-2026-07-23-release1"
 
 SHADERS = {
     "guest": {
@@ -51,6 +53,7 @@ SHADERS = {
         # exact optimum under every weighting tested.
         "gain": None,
         "mask_strategy": None,
+        "rgb_pareto": True,
     },
     "royale": {
         "module": "royale_ref",
@@ -77,6 +80,8 @@ SHADERS = {
         "file_base": "CRT Royale Kurozumi (Port)",
         "preset_base": "CRT Royale Kurozumi",
         "shader_name": "crt-royale-kurozumi (P22/PVM preset over crt-royale)",
+        "source": ("historical Kuro preset+Grade @ 7f34fc7469ec "
+                   "(Grade d5d58f8c8836) + upstream-fixed Royale bloom @ 3b0d6aa1d134"),
         "lut_channels": True,
         "gain": None,
         # Pixel-local is the default: every output pixel is scored separately.
@@ -89,12 +94,23 @@ SHADERS = {
         "file_base": "CRT Easymode (Port)",
         "preset_base": "CRT Easymode",
         "shader_name": "crt-easymode (Easymode, GPL)",
+        "source": "libretro/glsl-shaders @ 2b2c5ee3fd8e",
         "lut_channels": False,
         # BRIGHT_BOOST=1.2 clips the beam centre from x=0.849, which would pin
         # the LUT (and with it the adaptive control) over the top 15% of the
         # range. Carry B(x)/1.105 in the LUT and the gain in the mask instead:
         # saturation moves to the mask stage, where the shader also clips.
         "gain": 1.105,
+        "mask_strategy": None,
+    },
+    "lottes": {
+        "module": "lottes_ref",
+        "file_base": "CRT Lottes (Port)",
+        "preset_base": "CRT Lottes",
+        "shader_name": "crt-lottes (Timothy Lottes)",
+        "source": "libretro/glsl-shaders @ 2b2c5ee3fd8e",
+        "lut_channels": False,
+        "gain": None,
         "mask_strategy": None,
     },
 }
@@ -142,8 +158,289 @@ def v_moire(dark, bright, lut, xs=(0.25, 0.5, 0.75, 1.0)) -> float:
     return worst
 
 
+def _lottes_mask_tokens(ref, y: int = 7, z: int = 14) -> list[list[str]]:
+    """Exact all-code piecewise-sRGB calibration on the source 6x2 phase."""
+    rows = []
+    for py, source_row in enumerate(ref.MASK_TILE_LINEAR):
+        row = []
+        for px, pixel in enumerate(source_row):
+            lit = int(np.argmax(pixel))
+            row.append(fileio.encode_mask_token(4 >> lit, 16 + y, z))
+        rows.append(row)
+    return rows
+
+
+def _fit_lottes_fixed_v_exact(ref, h: np.ndarray,
+                              tokens: list[list[str]],
+                              mask_target: np.ndarray
+                              ) -> tuple[np.ndarray, np.ndarray]:
+    """Source-shaped fixed V refit against every 8-bit masked sRGB code.
+
+    Only each phase's DC sum is searched.  Tap ratios remain the exact
+    Tri+Bloom per-line decomposition, preventing a flat-field objective from
+    inventing a non-source beam merely to exploit fixed-point truncation.
+    """
+    codes = np.arange(256, dtype=np.int64)
+    h_levels = np.array([int(mm.fir_1d(
+        np.full(16, int(code), dtype=np.int64), h, np.array([8.0]))[0])
+        for code in codes], dtype=np.int64)
+    taps = np.repeat(h_levels[:, None], 4, axis=1)
+    mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
+    mask16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    table = np.zeros((256, 4), dtype=np.int64)
+    baseline = np.zeros((256, 4), dtype=np.int64)
+
+    for phase in range(129):
+        f = phase / 256.0
+        distances = np.array([f + 1.0, f, 1.0 - f, 2.0 - f])
+        shape = np.array([max(ref.beam_weight(float(d), 0.5), 0.0)
+                          for d in distances], dtype=np.float64)
+        shape /= shape.sum()
+        # The retained fixed-table calibration is the pure-power starting point;
+        # the exact search below corrects its piecewise-sRGB/fixed-point bias.
+        base_sum = int(round(256.0 * 0.84395
+                             * ref._vertical_gain(f) ** (1.0 / 2.2)))
+        target = np.stack([fitting.masked_reference_tile(
+            ref, np.array([f]), int(code), mask_target)[:, :, 0, :]
+            for code in codes])
+
+        def row_for_sum(total: int) -> np.ndarray:
+            if phase != 128:
+                return quantize.round_row_to_sum(shape * total, total)
+            total += total % 2
+            symmetric = 0.5 * (shape + shape[::-1])
+            pair = quantize.round_row_to_sum(
+                symmetric[:2] * total, total // 2)
+            return np.array([pair[0], pair[1], pair[1], pair[0]],
+                            dtype=np.int64)
+
+        baseline[phase] = row_for_sum(base_sum)
+        best = None
+        for total in range(max(0, base_sum - 20), base_sum + 21):
+            row = row_for_sum(total)
+            c128 = np.repeat((row * 128)[None, :], len(codes), axis=0)
+            vertical = mm._fir_accumulate(taps, c128)
+            rgb = np.repeat(vertical[:, None], 3, axis=1)
+            port = mm.mask_multiply(rgb[:, None, None, :], mask16[None, :, :, :])
+            error = float(np.mean((port - target) ** 2))
+            score = (error, abs(total - base_sum), total)
+            if best is None or score < best[0]:
+                best = (score, row)
+        table[phase] = best[1]
+
+    for phase in range(129, 256):
+        table[phase] = table[256 - phase][::-1]
+        baseline[phase] = baseline[256 - phase][::-1]
+    return table, baseline
+
+
+def _build_lottes(cfg: dict) -> None:
+    ref = __import__(cfg["module"])
+    fb, pb = cfg["file_base"], cfg["preset_base"]
+    provenance = f"{cfg['shader_name']}; {cfg['source']}"
+    h = fitting.fit_h(ref)
+    mask_target = fitting.mask_encoded_tile(ref)
+    tokens = _lottes_mask_tokens(ref)
+    v, baseline_v = _fit_lottes_fixed_v_exact(ref, h, tokens, mask_target)
+    identity = np.repeat(np.arange(256, dtype=np.int64)[:, None], 3, axis=1)
+    all_codes = np.arange(256, dtype=np.int64)
+    before, _ = fitting.rmse_exact_masked(
+        ref, baseline_v, baseline_v, h, identity, tokens, mask_target,
+        codes=all_codes, align=False)
+    after, max_error = fitting.rmse_exact_masked(
+        ref, v, v, h, identity, tokens, mask_target,
+        codes=all_codes, align=False)
+    if after >= before - 1e-9:
+        v = baseline_v
+        after = before
+    print(f"[lottes] exact all-code V refit: {before:.3f} -> {after:.3f} "
+          f"codes (max {max_error:.2f})")
+
+    common = [f"Original shader: {provenance}",
+              "Default Tri + 0.15*Bloom, true piecewise sRGB reference"]
+    hpath = os.path.join(ROOT, "Filters", f"{fb}_H.txt")
+    fileio.write_filter(hpath, fileio.FilterFile(
+        [f"Name: {fb}_H"] + common +
+        ["Source-derived separable LS blend: H3 .06003828, H5 .71920149, "
+         "H7 .22076023"], False, True, [h]))
+    vpath = os.path.join(ROOT, "Filters", f"{fb}_V.txt")
+    fileio.write_filter(vpath, fileio.FilterFile(
+        [f"Name: {fb}_V"] + common +
+        ["Fixed source-shaped V; phase DC refit over all 256 input codes",
+         "Pair with identity gamma (off) and the matching exact-sRGB mask"],
+        False, True, [v]))
+    mpath = os.path.join(ROOT, "Shadow_Masks", f"{fb}.txt")
+    fileio.write_mask(mpath, fileio.MaskFile(
+        [f"Name: {fb}", provenance,
+         "Source-anchored 6x2 stretched-VGA phase (pixel 0,0 is green-lit)",
+         "47e/27e/17e calibrated over all 256 codes against linear mask + piecewise sRGB",
+         f"Pair with {fb}_H and {fb}_V; gamma must be off"],
+        6, 2, tokens))
+
+    base = {"hfilter": f"{fb}_H.txt", "vfilter": f"{fb}_V.txt",
+            "sfilter": "same", "ifilter": f"{fb}_V.txt", "gamma": "off",
+            "mask": f"{fb}.txt", "maskmode": "1x"}
+    fileio.write_preset(os.path.join(ROOT, "Presets", f"{pb}.ini"), base)
+    fileio.write_preset(os.path.join(ROOT, "Presets", f"{pb} - TATE.ini"), {
+        **base, "hfilter": f"{fb}_V.txt", "vfilter": f"{fb}_H.txt",
+        "ifilter": f"{fb}_H.txt", "maskmode": "1x rotated"})
+    print("[lottes] wrote H, fixed V, exact mask, and two presets")
+
+
+def _build_kurozumi_bounded(cfg: dict) -> None:
+    """Recalibrate the canonical stable Kuro tables without the generic BCD.
+
+    The historical Grade oracle makes the generic full-period mask alternation
+    needlessly expensive (millions of source-ordered bloom evaluations).  A
+    bounded audit of direct Grade, scalarized, RGB-aware-V, and exact-LUT
+    candidates found the existing nonzero three-channel warp plus stable V/mask
+    to be the Pareto-safe seed.  Its only source regression was the modern
+    Grade-era lifted first entry.  Keep the measured stable tables, force true
+    historical code-zero, regenerate source-derived H/no-scanline tables, and
+    hard-gate the projected physical 1x2 grille before writing anything.
+    """
+    ref = __import__(cfg["module"])
+    fb, pb = cfg["file_base"], cfg["preset_base"]
+    source = cfg["source"]
+    provenance = f"{cfg['shader_name']}; {source}"
+
+    h = fitting.fit_h(ref)
+    v_cached = fileio.parse_filter(os.path.join(
+        ROOT, "Filters", f"{fb}_V Adaptive.txt"))
+    if not v_cached.adaptive or len(v_cached.sets) != 2:
+        raise RuntimeError("kurozumi: cached stable V seed is missing or invalid")
+    dark, bright = v_cached.dark, v_cached.bright
+    lut = fileio.parse_gamma(os.path.join(ROOT, "Gamma", f"{fb}.txt"))
+    mask_cached = fileio.parse_mask(os.path.join(
+        ROOT, "Shadow_Masks", f"{fb}.txt"))
+    tokens = mask_cached.tokens
+    if lut.shape != (256, 3) or tokens != [["63a", "33a"]]:
+        raise RuntimeError("kurozumi: canonical bounded LUT/mask seed changed")
+
+    # The old 2023-Grade build lifted black to (5,2,2).  Preserve it only as a
+    # deterministic before-control; the historical matched Grade maps black to
+    # the intended/practical finite result (0,0,0).
+    before_lut = lut.copy()
+    before_lut[0] = (5, 2, 2)
+    lut = lut.copy()
+    lut[0] = 0
+
+    phases = np.arange(0, 9, dtype=np.float64) / 16.0
+    neutral_rgbs = np.repeat(fitting.EVAL_CODES[:, None], 3, axis=1)
+    metric_kw = {"rgbs": neutral_rgbs, "phases": phases,
+                 "reference_period": (1, 2)}
+    neutral_before = fitting.rgb_masked_metrics(
+        ref, dark, bright, h, before_lut, tokens, **metric_kw)
+    neutral_after = fitting.rgb_masked_metrics(
+        ref, dark, bright, h, lut, tokens, **metric_kw)
+    rgb = fitting.rgb_masked_metrics(
+        ref, dark, bright, h, lut, tokens,
+        levels=np.array([0, 64, 128, 192, 255], dtype=np.int64),
+        phases=phases, reference_period=(1, 2))
+    moire = fitting.adaptive_moire_1080(dark, bright, lut)
+    selector = fitting.selector_control_jump(h, dark, bright, lut)
+    worst_flat = fitting.worst_flat_field_output(lut, dark, bright)
+    m_target = fitting.mask_encoded_tile(ref)
+    black_rms, black_max = fitting.rmse_exact_masked(
+        ref, dark, bright, h, lut, tokens, m_target,
+        codes=np.array([0], dtype=np.int64))
+
+    if np.any(lut[0] != 0) or black_rms > 0.05 or black_max > 0.5:
+        raise RuntimeError("kurozumi: historical zero-black gate failed")
+    if not fitting.gamma_quality_ok(lut):
+        raise RuntimeError(
+            f"kurozumi: gamma quantization gate failed {fitting.gamma_stats(lut)}")
+    if neutral_after["rms"] >= neutral_before["rms"] - 1.0e-6:
+        raise RuntimeError(
+            "kurozumi: bounded candidate did not improve historical neutral error")
+    if (neutral_after["rms"] > 28.0 or neutral_after["max"] > 178.0
+            or rgb["rms"] > 34.0 or rgb["max"] > 178.0
+            or moire > MOIRE_LIMIT or selector > 2 or worst_flat > 255.5):
+        raise RuntimeError(
+            "kurozumi: bounded fidelity/stability gate failed: "
+            f"neutral {neutral_after['rms']:.3f}/{neutral_after['max']:.1f}, "
+            f"RGB {rgb['rms']:.3f}/{rgb['max']:.1f}, moire {moire:.2f}, "
+            f"selector {selector}, clip {worst_flat:.2f}")
+
+    print(f"[kurozumi] bounded historical candidate: neutral "
+          f"{neutral_before['rms']:.3f}->{neutral_after['rms']:.3f}, "
+          f"RGB {rgb['rms']:.3f}/{rgb['max']:.1f}, black "
+          f"{black_rms:.3f}/{black_max:.1f}, moire {moire:.2f}, "
+          f"selector {selector}, clip {worst_flat:.2f}/255")
+
+    made = []
+    gpath = os.path.join(ROOT, "Gamma", f"{fb}.txt")
+    fileio.write_gamma(gpath, lut, header=[
+        f"Name: {fb}", provenance,
+        "Bounded historical Grade recalibration of the stable three-channel warp",
+        "True code-zero black; projected neutral/RGB Pareto and 1080p moire gated",
+        "Pair with the matching (Port) adaptive V and mask"])
+    made.append(gpath)
+
+    mpath = os.path.join(ROOT, "Shadow_Masks", f"{fb}.txt")
+    fileio.write_mask(mpath, fileio.MaskFile([
+        f"Name: {fb}", provenance,
+        "Stable end-to-end 1x2 aperture-grille fit in MiSTer v2 arithmetic",
+        "Selected against the historical Grade/Royale neutral and RGB oracle",
+        "Pair only with the matching (Port) gamma and adaptive V"],
+        len(tokens[0]), len(tokens), tokens))
+    made.append(mpath)
+
+    header_common = [f"Original shader: {provenance}",
+                     "Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)"]
+    vpath = os.path.join(ROOT, "Filters", f"{fb}_V Adaptive.txt")
+    fileio.write_filter(vpath, fileio.FilterFile(
+        [f"Name: {fb}_V Adaptive"] + header_common + [
+            "Stable adaptive seed retained by bounded historical neutral/RGB gate",
+            "Pair with the matching zero-black three-channel gamma and mask"],
+        True, True, [dark, bright]),
+        set_comments=["Primary coefficients (maximum RGB = 0)",
+                      "Secondary coefficients (maximum RGB = 255)"])
+    made.append(vpath)
+
+    nos = fitting.no_scanline_table(ref)
+    npath = os.path.join(ROOT, "Filters", f"{fb}_V No Scanlines.txt")
+    fileio.write_filter(npath, fileio.FilterFile(
+        [f"Name: {fb}_V No Scanlines"] + header_common + [
+            "Scan-free vertical interpolation; interlace fallback"],
+        False, True, [nos]))
+    made.append(npath)
+
+    hpath = os.path.join(ROOT, "Filters", f"{fb}_H.txt")
+    fileio.write_filter(hpath, fileio.FilterFile(
+        [f"Name: {fb}_H"] + header_common,
+        False, True, [h]))
+    made.append(hpath)
+
+    def preset(filename: str, entries: dict[str, str]) -> None:
+        path = os.path.join(ROOT, "Presets", filename)
+        fileio.write_preset(path, entries)
+        made.append(path)
+
+    base = {
+        "hfilter": f"{fb}_H.txt", "vfilter": f"{fb}_V Adaptive.txt",
+        "sfilter": "same", "ifilter": f"{fb}_V No Scanlines.txt",
+        "gamma": f"{fb}.txt", "mask": f"{fb}.txt", "maskmode": "1x",
+    }
+    preset(f"{pb}.ini", base)
+    preset(f"{pb} - TATE.ini", {
+        **base, "hfilter": f"{fb}_V Adaptive.txt", "vfilter": f"{fb}_H.txt",
+        "ifilter": f"{fb}_H.txt", "maskmode": "1x rotated",
+    })
+
+    print(f"[kurozumi] wrote {len(made)} files")
+    for path in made:
+        print("   ", os.path.relpath(path, ROOT))
+
+
 def build(key: str) -> None:
     cfg = SHADERS[key]
+    if key == "lottes":
+        _build_lottes(cfg)
+        return
+    if key == "kurozumi":
+        _build_kurozumi_bounded(cfg)
+        return
     ref = __import__(cfg["module"])
     fb, pb = cfg["file_base"], cfg["preset_base"]
     source = cfg.get("source", f"libretro/slang-shaders @ {COMMIT[:12]}")
@@ -214,6 +511,16 @@ def build(key: str) -> None:
             print(f"[{key}] refine pass {it + 1}: RMSE "
                   f"{new_score:.3f} codes (mask off)")
 
+        if cfg.get("rgb_pareto"):
+            lut, dark, bright, rgb_info = fitting.fit_v_rgb_pareto(
+                ref, h, tokens, baseline=(lut, dark, bright))
+            print(f"[{key}] RGB Pareto fit: {rgb_info['label']}; "
+                  f"RGB {rgb_info['rgb_rms']:.3f}/{rgb_info['rgb_max']:.1f}, "
+                  f"neutral {rgb_info['neutral_rms']:.3f}/"
+                  f"{rgb_info['neutral_max']:.1f}, "
+                  f"moire {rgb_info['moire']:.2f}, "
+                  f"clip {rgb_info['worst_flat']:.2f}/255")
+
     # ---- mask, refit against the finished filters ---------------------------
     # The isolated fit matched the shader's multipliers; now that the V/LUT are
     # known, refit so the mask minimizes the error of the PRODUCT (absorbing
@@ -223,7 +530,7 @@ def build(key: str) -> None:
     dgroup = len(tokens[0]) // 2 if minfo["dithered"] else None
     tok_j, r_after = fitting.fit_mask_joint(ref, lut, dark, bright, h, tokens,
                                             m_target, dither_group=dgroup)
-    if r_after < r_before - 0.05:
+    if not cfg.get("rgb_pareto") and r_after < r_before - 0.05:
         print(f"[{key}] mask refit (joint): masked RMSE {r_before:.3f} -> "
               f"{r_after:.3f} codes -- adopted")
         tokens = tok_j
@@ -244,7 +551,7 @@ def build(key: str) -> None:
             ref, lut_m, dark, bright, h, tokens, m_target)
         r_now, _ = fitting.rmse_exact_masked(
             ref, dark, bright, h, lut, tokens, m_target)
-        if r_m < r_now - 0.05:
+        if not cfg.get("rgb_pareto") and r_m < r_now - 0.05:
             print(f"[{key}] mask-aware LUT pass: masked RMSE {r_now:.3f} -> "
                   f"{r_m:.3f} codes -- adopted")
             lut, tokens = lut_m, tok_m
@@ -282,8 +589,8 @@ def build(key: str) -> None:
     # Runs AFTER any stability blend so the LUT is refined against the exact
     # tables that ship.  radius=8 searches a wider LUT neighbourhood than the
     # in-loop pass; the exact self-gate keeps only measured whole-pipeline wins
-    # (2026-07-21 audit: adopted for Royale 19.968->18.989 and Kurozumi
-    # 19.854->18.448; a no-op where the in-loop pass already converged).
+    # (2026-07-21 audit: adopted for Royale 19.968->18.989; Kurozumi now uses
+    # the separate bounded historical branch above.)
     for it in range(8):
         r_now, _ = fitting.rmse_exact_masked(
             ref, dark, bright, h, lut, tokens, m_target)
@@ -299,7 +606,7 @@ def build(key: str) -> None:
             break
         tok_p, r_p = fitting.fit_mask_joint(
             ref, lut_p, dark, bright, h, tokens, m_target)
-        if r_p < r_now - 0.05:
+        if not cfg.get("rgb_pareto") and r_p < r_now - 0.05:
             print(f"[{key}] polish pass {it + 1}: masked RMSE {r_now:.3f} -> "
                   f"{r_p:.3f} codes -- adopted")
             lut, tokens = lut_p, tok_p
@@ -308,9 +615,36 @@ def build(key: str) -> None:
                   "-- kept")
             break
 
-    gain_note = (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
-                 f"the mask carries {gain:.3f}" if gain else
-                 "Monotone adaptive-control warp co-optimized with the V fit")
+    if cfg.get("rgb_pareto"):
+        selector = fitting.selector_control_jump(h, dark, bright, lut)
+        if selector > 16:
+            dark, bright, selector_info = fitting.constrain_selector_phase128(
+                dark, bright, h, lut, limit=16)
+            selector = selector_info["selector"]
+            print(f"[{key}] phase-128 selector fit: "
+                  f"deltas {selector_info['delta_dark']:+d}/"
+                  f"{selector_info['delta_bright']:+d}, jump {selector} codes")
+        rgb_final = fitting.rgb_masked_metrics(
+            ref, dark, bright, h, lut, tokens)
+        neutral_final, neutral_max = fitting.rmse_exact_masked(
+            ref, dark, bright, h, lut, tokens, m_target)
+        if (rgb_final["rms"] > 6.25 or rgb_final["max"] > 24.0
+                or neutral_final > 2.5 or neutral_max > 10.0
+                or selector > 16):
+            raise RuntimeError(
+                f"{key}: final RGB/neutral/selector self-gate failed: "
+                f"RGB {rgb_final['rms']:.3f}/{rgb_final['max']:.1f}, "
+                f"neutral {neutral_final:.3f}/{neutral_max:.1f}, "
+                f"selector {selector}")
+        print(f"[{key}] final RGB cube: RMSE {rgb_final['rms']:.3f}, "
+              f"max {rgb_final['max']:.1f}, neutral {neutral_final:.3f}/"
+              f"{neutral_max:.1f}, selector {selector}")
+
+    gain_note = ("RGB-cube Pareto gamma/V fit with shared max-RGB control"
+                 if cfg.get("rgb_pareto") else
+                 (f"Gain-split: LUT carries the pre-clip transfer / {gain:.3f}; "
+                  f"the mask carries {gain:.3f}" if gain else
+                  "Monotone adaptive-control warp co-optimized with the V fit"))
     gpath = os.path.join(ROOT, "Gamma", f"{fb}.txt")
     fileio.write_gamma(gpath, lut, header=[
         f"Name: {fb}", provenance, gain_note,

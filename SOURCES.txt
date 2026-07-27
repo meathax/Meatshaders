@@ -1,178 +1,152 @@
-============================================================
- SOURCES, PROVENANCE AND FORMAT REFERENCES - v6 exact-hardware edition
-============================================================
+====================================================================
+ SOURCES, LICENSES AND REPRODUCIBLE PROVENANCE - 1080p v7
+====================================================================
 
-Audit date: 2026-07-17
+Audit date: 2026-07-27
 
-Canonical shader sources
+This pack is derived from the real shader programs named below. Git commits
+and paths are immutable source locks; the Guest archive additionally has a
+SHA-256 checksum. MiSTer cannot execute GLSL/Slang, so tools/targets/ contains
+executable default-parameter reference math and tools/build_port.py projects
+that math into the scaler, LUT and mask operations the FPGA actually exposes.
+
+
+CANONICAL SHADER SOURCES
 ------------------------
-libretro/glsl-shaders commit:
-  2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
 
-CRT Easymode (original shader by Easymode; header states GPL):
-  https://github.com/libretro/glsl-shaders/blob/2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d/crt/shaders/crt-easymode.glsl
+CRT Easymode (Easymode; source header states GPL)
+  Repository: https://github.com/libretro/glsl-shaders
+  Commit:     2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
+  File:       crt/shaders/crt-easymode.glsl
+  Direct:     https://github.com/libretro/glsl-shaders/blob/2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d/crt/shaders/crt-easymode.glsl
 
-CRT Lottes (original shader by Timothy Lottes; source states public domain):
-  https://github.com/libretro/glsl-shaders/blob/2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d/crt/shaders/crt-lottes.glsl
+CRT Lottes (Timothy Lottes; source explicitly dedicates it to public domain)
+  Repository: https://github.com/libretro/glsl-shaders
+  Commit:     2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
+  File:       crt/shaders/crt-lottes.glsl
+  Direct:     https://github.com/libretro/glsl-shaders/blob/2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d/crt/shaders/crt-lottes.glsl
+  Original:   https://www.shadertoy.com/view/MtSfRK
 
+CRT Guest Advanced (guest.r; GPL)
+  Primary discussion:
+    https://forums.libretro.com/t/new-crt-shader-from-guest-crt-guest-advanced-updates/25444/1
+  Source archive: crt-guest-advanced-2026-07-23-release1
+    https://mega.nz/file/k9ZwlQLS#MOC9RbHMJMBLEXP0-qd1TrgwPj-3MvAnSWjX9wFRV2w
+  Archive SHA-256:
+    a006a3785f787a3e0bff6c4ed3f505a396b07274bf7fe341b6877d02a4fa7560
+  Preset: crt-guest-advanced.slangp; no parameter overrides.
+  Cross-check repository: https://github.com/libretro/slang-shaders
+  Cross-check commit: 3b0d6aa1d134a168478cd9c904a866d969f8882b
+  Cross-check preset:
+    https://github.com/libretro/slang-shaders/blob/3b0d6aa1d134a168478cd9c904a866d969f8882b/crt/crt-guest-advanced.slangp
+  The 2026-07-23 spatial defaults match this libretro pin. The release changes
+  the temporal afterglow near-black subtraction from 1.25/255 to 0.5/255;
+  MiSTer's scaler has no previous-frame buffer, so that temporal pass cannot be
+  represented and is not claimed by the static reference.
 
-MiSTer implementation references
---------------------------------
-MiSTer Main commit:
-  7317947f41f6d085444ff00d297896aba2041ca0
-  https://github.com/MiSTer-devel/Main_MiSTer
+CRT Royale (TroggleMonkey; GPL)
+  Author-owned original:
+    https://github.com/TroggleMonkey/common-shaders/tree/53329b74a3f9b5af1a48e56473fabd370bdbd8ca/crt/shaders/crt-royale
+  Original preset:
+    https://github.com/TroggleMonkey/common-shaders/blob/53329b74a3f9b5af1a48e56473fabd370bdbd8ca/crt/crt-royale.cgp
+  Maintained Slang port used for the executable reference:
+  Repository: https://github.com/libretro/slang-shaders
+  Commit:     3b0d6aa1d134a168478cd9c904a866d969f8882b
+  Preset:     crt/crt-royale.slangp
+  Shader tree: crt/shaders/crt-royale/src/
+  Direct:     https://github.com/libretro/slang-shaders/blob/3b0d6aa1d134a168478cd9c904a866d969f8882b/crt/crt-royale.slangp
+  The original static default uses an exact beam-spot power of 1/3; the active
+  maintained Slang parameter is 0.33. This pack follows the active Slang port
+  and records the tiny distinction instead of conflating the two revisions.
 
-Relevant source:
-  video.cpp  - filter, gamma, shadow-mask and preset parsers
-  cfg.cpp    - supported MiSTer.ini keys
-  menu.cpp   - current Video Processing labels
+CRT Royale Kurozumi (Kurozumi preset over CRT Royale; historical Grade is
+public domain, while the combined Royale chain remains GPL-derived)
+  Repository: https://github.com/libretro/slang-shaders
+  Canonical matched commit: 7f34fc7469ecc7d90e03df45d1a10975136eb712
+  Preset: presets/crt-royale-kurozumi.slangp
+    https://github.com/libretro/slang-shaders/blob/7f34fc7469ecc7d90e03df45d1a10975136eb712/presets/crt-royale-kurozumi.slangp
+  Grade: misc/shaders/grade.slang
+    https://github.com/libretro/slang-shaders/blob/7f34fc7469ecc7d90e03df45d1a10975136eb712/misc/shaders/grade.slang
+  Matching Grade blob: d5d58f8c88369b062e683d3e52c733535d400a85
+  Cross-check fix commit: 340b533a7c1889c8e18e59bc89dab1867a4116bb
 
-MiSTer Template commit:
-  6d29ac7ca3c721792a72e30393357c57fb7f8f1b
-  https://github.com/MiSTer-devel/Template_MiSTer
+The historical Grade lock is deliberate. The current Kurozumi preset still
+names old Grade parameters that disappeared when Grade was replaced in 2023,
+so combining the unchanged preset with current Grade silently drops intended
+gamma/color controls and raises black. This pack uses the matched historical
+Grade/preset for its active P22 transform, gun response, D65 and true zero
+black, while retaining current pinned Royale. Audited core Royale blobs are
+identical except one intentional upstream correction: historical
+crt-royale-bloom-approx.h computes a Gaussian but outputs the unblurred input;
+the current blob 92af7e73... outputs the computed color. A later irrelevant
+geometry guard is the only other sampled delta. The accidental modern-Grade
+compatibility combination is not shipped.
 
-Relevant source:
-  sys/ascal.vhd       - polyphase scaler and adaptive luminance blending
-  sys/video_mixer.sv  - gamma placement before the scaler
-  sys/shadowmask.sv   - v2 mask multipliers
-  sys/sys_top.v       - scaler then HDMI shadow-mask pipeline order
-
-
-Official format collections/specifications
-------------------------------------------
-Filters and Gamma:
-  https://github.com/MiSTer-devel/Filters_MiSTer
-  Audited commit: 00416db7c6d0ae304e59e63ab06ccf95e23124cf
-
-Shadow Masks:
-  https://github.com/MiSTer-devel/ShadowMasks_MiSTer
-  Audited commit: 9f0948c50bbf5bdd9254417d13977b2ba2ef9d36
-
-Video Presets:
-  https://github.com/MiSTer-devel/Presets_MiSTer
-  Audited commit: fcd51acfb5bc605ea472fd411b3eeae1cf54d692
-
-
-Relevant MiSTer feature history
--------------------------------
-64-phase filters:
-  https://github.com/MiSTer-devel/Main_MiSTer/commit/21e35bbf2f0879002563e0acceaf7794104bb9f8
-
-256-phase filters:
-  https://github.com/MiSTer-devel/Main_MiSTer/commit/e509b8ec83e2f6a1e2eea08b6e8b8a09943fffc8
-
-10-bit coefficients:
-  https://github.com/MiSTer-devel/Main_MiSTer/commit/9ace959408a7c86cbb00ee5321ee34947d728e84
-
-Adaptive filters:
-  https://github.com/MiSTer-devel/Main_MiSTer/commit/4e671f91aaf8fd1fa14e2aa53c78c0840f2b4f0d
-
-
-V4 numerical derivations
-------------------------
-Easymode:
-  - canonical Lanczos-family H with SHARPNESS_H squared as in source;
-  - direct phase/RGB fit to MiSTer max-RGB adaptive interpolation;
-  - source cutoff vertical interpolation with SHARPNESS_V=1;
-  - exact binary/multilevel audit of the retired anti-ringing H fit; the stable
-    Pixel-Art preset names now alias canonical H after no pointwise-safe fixed
-    FIR improvement was found in the exact integer search;
-  - exact shadowmask.sv shift/add/truncate model for paired gain fitting.
-
-Lottes:
-  - source-default Tri + bloomAmount*Bloom kernel with DO_BLOOM enabled;
-  - constrained rank-one four-tap fit of H3/H5/H7 and Scan/BloomScan;
-  - exact piecewise sRGB target evaluation for matched V/mask fitting;
-  - exact shadowmask.sv arithmetic for 47e/27e/17e calibration.
-
-All stored tables contain 256 phases and are quantised to signed 10-bit values.
-Current RTL selects runtime phase by truncating the 12-bit fraction to its top
-eight bits (`frac12 >> 4`), with no rounding or carry. Adaptive A/B interpolation
-performs one signed shift after the weighted sum, so odd 3.15 coefficients are
-valid. Conjugate rows are exact tap reversals; phase 128 is self-symmetric.
+The current glsl-shaders and slang-shaders locks used by Easymode, Lottes,
+Guest cross-checking and Royale were still repository HEAD revisions when
+rechecked on 2026-07-27.
 
 
-Port status
------------
-The coefficient tables are numerical fixed-pipeline derivatives of the named
-shader kernels. Easymode-derived material retains the original shader's GPL
-licensing status. Lottes' source explicitly permits unrestricted reuse.
+MISTER HARDWARE AND PRESET REFERENCES
+-------------------------------------
 
-No claim is made that MiSTer's fixed pipeline executes or fully reproduces the
-original shader programs. See README.txt and AUDIT_REPORT.txt for limitations.
+MiSTer Main
+  Repository: https://github.com/MiSTer-devel/Main_MiSTer
+  Audited HEAD: ffcdf1edb52c95705298d2fe23e9737e08b75b65
+  Relevant files:
+    video.cpp  - filter, gamma, mask and preset parsing
+    cfg.cpp    - MiSTer.ini option bounds
+    MiSTer.ini - official 1080p and scaling-mode definitions
+
+MiSTer Template
+  Repository: https://github.com/MiSTer-devel/Template_MiSTer
+  Audited HEAD: 69b8a2acc6d84dd313b5abcba6a17155287ed3d8
+  Relevant files:
+    sys/ascal.vhd       - polyphase FIR and adaptive max-RGB interpolation
+    sys/video_mixer.sv  - gamma placement
+    sys/shadowmask.sv   - v2 token shift/add multiplication
+    sys/sys_top.v       - scaler-to-mask pipeline order
+
+Format collections used to cross-check emitted syntax:
+  Filters/Gamma: https://github.com/MiSTer-devel/Filters_MiSTer
+    audited commit 00416db7c6d0ae304e59e63ab06ccf95e23124cf
+  Masks: https://github.com/MiSTer-devel/ShadowMasks_MiSTer
+    audited commit 9f0948c50bbf5bdd9254417d13977b2ba2ef9d36
+  Presets: https://github.com/MiSTer-devel/Presets_MiSTer
+    audited commit fcd51acfb5bc605ea472fd411b3eeae1cf54d692
+
+Current RTL still uses 256 phases selected by the upper eight fractional bits,
+signed 10-bit coefficient tables, a single maximum-RGB adaptive control value,
+gamma before scaling, and v2 mask multiplication after scaling. A preset can
+name H/V/scan/interlace filters, gamma, mask and mask orientation. It has no
+programmable pass, history buffer, color matrix, curvature or arbitrary blur.
 
 
-============================================================
- EXPANDED SHADER SOURCES AND CURRENT TOOLCHAIN (2026-07-17)
-============================================================
+PORT IMPLEMENTATION
+-------------------
 
-Canonical shader sources (libretro/slang-shaders, all pinned to commit
-3b0d6aa1d134a168478cd9c904a866d969f8882b):
+The reproducible references are:
+  tools/targets/easymode_ref.py
+  tools/targets/guest_advanced_ref.py
+  tools/targets/lottes_ref.py
+  tools/targets/royale_ref.py
+  tools/targets/kurozumi_ref.py
 
-CRT Guest Advanced (by guest.r, GPL) - SUPERSEDED 2026-07-21 for the Guest
-families by guest.r's upstream release drop (see below); the libretro pin
-remains the cross-check reference:
-  crt/crt-guest-advanced.slangp and crt/shaders/guest/advanced/*
-CRT Royale (by TroggleMonkey, GPL):
-  crt/crt-royale.slangp and crt/shaders/crt-royale/src/*
-CRT Royale Kurozumi (P22/PVM parameter preset over crt-royale):
-  presets/crt-royale-kurozumi.slangp (+ grade.slang pass)
+The build and hardware model are:
+  tools/build_port.py
+  tools/fitting.py
+  tools/mister_model.py
+  tools/fileio.py
 
-Guest source of truth (2026-07-21): guest.r upstream release drop
-  crt-guest-advanced-2026-07-12-release1
-  local copy: D:/Downloads/crt-guest-advanced-2026-07-12-release1
-  preset: crt-guest-advanced.slangp (no parameter overrides; pure #pragma
-          defaults; GPL, Copyright guest(r) 2018-2026)
-  Verified pass by pass against the libretro pin above: the advanced chain is
-  numerically identical at default parameters (new ssharp/bloomsamp params
-  default off; glow/bloom sigma rescales are 1 at default radii).
+The v7 audit evaluates exact RGB as well as neutral fields, the complete
+source/hardware mask supercell at the declared output origin, signal-dependent
+piecewise-sRGB mask behavior for Lottes, RGB shared-control behavior for Guest,
+and complete 1080-line stability at 224p and 240p. Generated filters have 256
+phases and signed 10-bit coefficients and are accepted through the integer RTL
+model, not floating coefficient-sum estimates.
 
-Reproducible executable references are vendored in tools/targets/:
-  easymode_ref.py
-  guest_advanced_ref.py
-  kurozumi_ref.py
-  lottes_ref.py
-  royale_ref.py
-
-They replace the original session scratchpad dependency. The build uses these
-files by default; MISTER_SHADER_REFERENCES is only an explicit override.
-
-MiSTer implementation references re-verified for the canonical pack at the
-pinned commits (Main 7317947f, Template 6d29ac7c): ascal.vhd polyphase and
-adaptive-lerp arithmetic, shadowmask.sv v2 token decode and shift/add
-truncation, video.cpp preset/filter/gamma/mask parsing, video_mixer.sv
-gamma placement, sys_top.v pipeline order.
-
-Rechecked 2026-07-17: Main's current HEAD still equals the pinned Main commit.
-Template has advanced, but comparison from 6d29ac7c to current HEAD changes
-only sys/yc_out.sv; the audited scaler and shadow-mask RTL is unchanged.
-
-Rechecked 2026-07-21 (Royale/Kurozumi/Lottes re-audit): every audited
-crt-royale source file, presets/crt-royale-kurozumi.slangp, misc/shaders/
-grade.slang and crt/shaders/crt-lottes.glsl is byte-identical between the
-pinned revisions and current upstream master; the pins remain the real
-sources.  The vendored royale_ref/kurozumi_ref/lottes_ref modules were
-verified against them formula by formula (grade gray-axis chain included).
-
-Current toolchain (kept in tools/ so the pack can be regenerated):
-  fileio.py         format parsers/writers/validators
-  quantize.py       symmetric 10-bit quantizer
-  mister_model.py   RTL-exact pipeline model (F1-F5 verified facts)
-  fitting.py        LUT co-optimization + adaptive/fixed/H/mask fitters
-  build_port.py     per-shader generation driver
-  validate_port.py  acceptance gates (formats, RMSE, brightness,
-                    clipping, moire)
-  validate_patterns.py nonuniform selector/RGB/impulse/step/checker diagnostics
-  preset_contracts.py exact 10-preset semantic, manifest and axis contracts
-  selftest_mister_model.py exact phase/FIR/adaptive/mask arithmetic regressions
-  selftest_mask_period.py full-LCM FFT vs brute force, including mask mode 2x
-  selftest_presets.py exact preset inventory and cross-preset pairings
-  DESIGN.md         the mapping specification
-
-Current acceptance evaluates complete 1080-line frames at 224p and 240p,
-scores the full periodic LCM supercell at strict origin, refines Kurozumi
-channel-aware through its colored black lift, and gates gamma quality,
-clipping, moire, RMS and maximum individual-pixel error.
-
-Guest Advanced and Royale sources are GPL; the derived coefficient tables
-retain that licensing status. Kurozumi is a parameter set over Royale.
+Easymode- and Guest/Royale-derived material retains the corresponding source
+license status. Kurozumi is a preset over Royale; Lottes' source states public
+domain. These files reproduce source behavior only within MiSTer's documented
+fixed pipeline. See tools/DESIGN.md and AUDIT_REPORT.txt for the measured
+mapping and irreducible limits.

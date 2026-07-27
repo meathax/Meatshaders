@@ -1,5 +1,5 @@
 # Name: CRT Easymode (Port)_H
-# Original shader: crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Original shader: crt-easymode (Easymode, GPL); libretro/glsl-shaders @ 2b2c5ee3fd8e
 # Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
 
 10bit

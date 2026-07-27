@@ -29,6 +29,20 @@ CODES = np.array([0, 17, 93, 255], dtype=np.int64)
 FS = np.arange(0, 33) / 64.0
 
 
+class EncodedFallbackRef:
+    """Guest beam math without its exact-mask hook.
+
+    This test deliberately supplies arbitrary encoded target tiles, so it must
+    exercise fitting.py's generic ``beam * encoded multiplier`` fallback rather
+    than Guest's real fixed CGWG mask ordering.
+    """
+
+    ref_vertical = staticmethod(ref.ref_vertical)
+
+
+fallback_ref = EncodedFallbackRef()
+
+
 def brute(dark, bright, h, lut, tokens, target, mask_scale):
     """Independent exhaustive roll scorer over the complete LCM supercell."""
     mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
@@ -50,7 +64,7 @@ def brute(dark, bright, h, lut, tokens, target, mask_scale):
                                 hardware[:, :, None, :])
         beam = np.array([[
             fitting._ref_vertical_unclipped(
-                ref, f, int(code) / 255.0, channel)
+                fallback_ref, f, int(code) / 255.0, channel)
             for channel in "rgb"] for f in FS])
         for dy in range(th):
             for dx in range(tw):
@@ -69,7 +83,7 @@ def brute(dark, bright, h, lut, tokens, target, mask_scale):
 
 def check_scale(dark, bright, h, lut, tokens, target, scale):
     exact = fitting._rmse_exact_masked_periodic(
-        ref, dark, bright, h, lut, tokens, target,
+        fallback_ref, dark, bright, h, lut, tokens, target,
         codes=CODES, mask_scale=scale)
     slow = brute(dark, bright, h, lut, tokens, target, scale)
     if not np.isclose(exact[0], slow[0], atol=1e-9):
@@ -106,13 +120,13 @@ def main():
     ])
     unity_tokens = [["700"]]
     full, _, _ = fitting._rmse_exact_masked_periodic(
-        ref, v.dark, v.bright, h, lut, unity_tokens, crop_target,
+        fallback_ref, v.dark, v.bright, h, lut, unity_tokens, crop_target,
         codes=CODES, align=False)
 
     # Independently score only the upper-left cell, reproducing the historical
     # bug's domain.  It should look materially better than the honest 2x2 cell.
     cropped, _, _ = fitting._rmse_exact_masked_periodic(
-        ref, v.dark, v.bright, h, lut, unity_tokens,
+        fallback_ref, v.dark, v.bright, h, lut, unity_tokens,
         crop_target[:1, :1], codes=CODES, align=False)
     if not full > cropped + 5.0:
         raise AssertionError(

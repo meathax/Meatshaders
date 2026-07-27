@@ -361,11 +361,29 @@ def _mask_tile():
 MASK_TILE_LINEAR = _mask_tile()
 
 
+def ref_masked(f, x, px, py, channel):
+    """Exact final encoded output for a uniform field through ``Mask()``.
+
+    Lottes multiplies the 1.5/0.5 mask in true linear light and only then runs
+    the piecewise sRGB encode.  Consequently there is no signal-independent
+    encoded multiplier: ``ToSrgb(E*m) / ToSrgb(E)`` varies strongly near the
+    sRGB toe.  This hook is the authority used by the fitter and validator.
+    """
+    channel_index = {"r": 0, "g": 1, "b": 2}[channel]
+    f = abs(float(f)) % 1.0
+    if f > 0.5:
+        f = 1.0 - f
+    x = _clamp01(float(x))
+    linear = fetch_linear(x) * _vertical_gain(f)
+    linear *= MASK_TILE_LINEAR[int(py) % 2][int(px) % 6][channel_index]
+    return _clamp01(to_srgb1(linear))
+
+
 def _canonical_tokens():
-    """MiSTer v2 mask tokens for the TRUE tile, derived (not hardcoded).
+    """Pure-power initialization tokens for the TRUE tile (not final fit).
 
     Token XYZ hex: X = channel bitmask (4=R, 2=G, 1=B); selected channels get
-    (16+Y)/16, others Z/16.  Encoded multipliers are m^(1/2.2), quantized to
+    (16+Y)/16, others Z/16.  The initializer uses m^(1/2.2), quantized to
     the 1/16 grid: 1.5 -> 1.202379 -> Y = round(1.202379*16) - 16 = 3;
     0.5 -> 0.729740 -> Z = round(0.729740*16) = 12 = 'c'."""
     y = round(MASK_LIGHT ** (1.0 / 2.2) * 16) - 16
@@ -385,12 +403,13 @@ def mask_spec():
     Applied in LINEAR light (main() line 414), BEFORE the sRGB encode.
 
     ENCODED-SPACE PORT.  MiSTer's v2 mask multiplies in the encoded 8-bit
-    domain, after gamma+scaler.  sRGB is close to a pure 2.2 power over the
-    mask's operating range, so multiplier m maps to m^(1/2.2):
+    domain, after the scaler.  The old approximation treated sRGB as a pure
+    2.2 power and mapped multiplier m to m^(1/2.2):
         1.5 -> 1.202379   (x16 = 19.24 -> 19/16 = 1.1875, i.e. token nibble Y=3)
         0.5 -> 0.729740   (x16 = 11.68 -> 12/16 = 0.75,   i.e. token nibble Z=c)
-    which reproduces the shipped canonical mask tokens 43c/23c/13c EXACTLY.
-    Mean encoded multiplier = (2*1.202379 + 4*0.729740)/6 = 0.887286."""
+    This is useful only to initialize the discrete token search.  The final
+    token grid is fitted and validated with ref_masked(), which evaluates the
+    true signal-dependent piecewise-sRGB result over every input code."""
     lin_avg = (2.0 * MASK_LIGHT + 4.0 * MASK_DARK) / 6.0
     enc = [[[m ** (1.0 / 2.2) for m in px] for px in row] for row in MASK_TILE_LINEAR]
     enc_avg = (2.0 * MASK_LIGHT ** (1 / 2.2) + 4.0 * MASK_DARK ** (1 / 2.2)) / 6.0
@@ -408,18 +427,10 @@ def mask_spec():
         "mask_dark": MASK_DARK,
         "avg_transmission": lin_avg,                       # 0.833333, linear
         "avg_transmission_per_channel": [lin_avg] * 3,
-        "encoded_equivalent_multipliers": enc,             # m^(1/2.2)
-        "avg_transmission_encoded": enc_avg,               # 0.887286
-        "mister_v2_tokens_canonical": _canonical_tokens(),
-        "mister_v2_tokens_shipped_v4": [["43c", "43c", "23c", "23c", "13c", "13c"],
-                                        ["23c", "13c", "13c", "43c", "43c", "23c"]],
-        "phase_note":
-            "The shipped v4 tiles start at R for output pixel (0,0); the shader "
-            "gives G there (n = 2). The v4 grid is the true tile rolled LEFT by "
-            "4 px (equivalently right by 2) -- verified exactly; the tokens and "
-            "the +3px/line stretch are otherwise identical. A whole-tile phase "
-            "shift of a screen-wide repeating mask is invisible, but it IS a "
-            "deviation from the source.",
+        "pure_power_initialization_multipliers": enc,       # not a score target
+        "pure_power_initialization_mean": enc_avg,
+        "mister_v2_tokens_initial": _canonical_tokens(),
+        "phase_note": "Tile origin follows the shader exactly: pixel (0,0) is G-lit.",
     }
 
 
@@ -606,4 +617,5 @@ if __name__ == "__main__":
     print("h_kernel(0.5) =", h_kernel(0.5))
     ms = mask_spec()
     print("mask avg transmission (linear) =", ms["avg_transmission"])
-    print("mask avg transmission (encoded) =", ms["avg_transmission_encoded"])
+    print("mask pure-power initialization mean =",
+          ms["pure_power_initialization_mean"])

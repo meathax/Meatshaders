@@ -1,9 +1,9 @@
 # Name: CRT Royale Kurozumi (Port)
-# crt-royale-kurozumi (P22/PVM preset over crt-royale); libretro/slang-shaders @ 3b0d6aa1d134
-# Monotone adaptive-control warp co-optimized with the V fit
-# Co-optimized with the adaptive V fit and refined against MiSTer's
-# exact truncating arithmetic; pair with the matching (Port) files
-5,2,2
+# crt-royale-kurozumi (P22/PVM preset over crt-royale); historical Kuro preset+Grade @ 7f34fc7469ec (Grade d5d58f8c8836) + upstream-fixed Royale bloom @ 3b0d6aa1d134
+# Bounded historical Grade recalibration of the stable three-channel warp
+# True code-zero black; projected neutral/RGB Pareto and 1080p moire gated
+# Pair with the matching (Port) adaptive V and mask
+0,0,0
 8,4,5
 9,5,6
 11,5,8

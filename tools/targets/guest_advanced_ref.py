@@ -1,13 +1,13 @@
 """
 Reference implementation of CRT-GUEST-ADVANCED (guest.r) at DEFAULT parameters.
 
-Source: crt-guest-advanced-2026-07-12-release1 (guest.r upstream release drop,
-        D:/Downloads/crt-guest-advanced-2026-07-12-release1).  Verified line by
-        line against libretro/slang-shaders @ 3b0d6aa1d134 (master, 2026-07-15):
-        at DEFAULT parameters the two are numerically identical -- the release
-        adds only `ssharp` (0.0 -> ssub term vanishes) and `bloomsamp`
-        (0.0 -> st() keeps wts=-10 and the BloomPass mix is skipped), and the
-        glow/bloom sigma rescale factors are exactly 1 at default sizes.
+Source: crt-guest-advanced-2026-07-23-release1 (guest.r upstream release
+        archive, SHA256 a006a3785f787a3e0bff6c4ed3f505a396b07274bf7fe341b6877d02a4fa7560).
+        Its default spatial path and preset are cross-checked against
+        libretro/slang-shaders @ 3b0d6aa1d134 (master, 2026-07-15).  The newer
+        release changes the temporal afterglow near-black subtraction from
+        1.25/255 to 0.5/255; that frame-feedback pass is deliberately outside
+        this static MiSTer reference (see notes()).
 Preset: crt-guest-advanced.slangp  (sets NO parameter overrides -> pure #pragma defaults)
 
 Pass chain (12 passes):
@@ -78,9 +78,10 @@ DEFAULTS = {
 }
 
 PROVENANCE = {
-    "source": "crt-guest-advanced-2026-07-12-release1 (guest.r release drop)",
+    "source": "crt-guest-advanced-2026-07-23-release1 (guest.r release archive)",
+    "source_sha256": "a006a3785f787a3e0bff6c4ed3f505a396b07274bf7fe341b6877d02a4fa7560",
     "cross_check": "libretro/slang-shaders @ "
-                   "3b0d6aa1d134a168478cd9c904a866d969f8882b (identical at defaults)",
+                   "3b0d6aa1d134a168478cd9c904a866d969f8882b (spatial defaults identical)",
     "preset": "crt-guest-advanced.slangp",
     "preset_overrides": "none",
 }
@@ -145,6 +146,97 @@ def transfer(x):
     return ref_vertical(0.0, x)
 
 
+def _vec3(value, name, unit_interval=False):
+    """Normalize a scalar or three-element iterable to an immutable vec3."""
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        out = tuple(float(v) for v in value)
+        if len(out) != 3:
+            raise ValueError(f"{name} must be a scalar or three values")
+    else:
+        out = (scalar, scalar, scalar)
+    if not all(math.isfinite(v) for v in out):
+        raise ValueError(f"{name} values must be finite")
+    if unit_interval and not all(0.0 <= v <= 1.0 for v in out):
+        raise ValueError(f"{name} values must be in 0..1")
+    if not unit_interval and not all(v >= 0.0 for v in out):
+        raise ValueError(f"{name} multipliers must be non-negative")
+    return out
+
+
+def ref_vertical_rgb(f, rgb, mask_mult=(1.0, 1.0, 1.0)):
+    """Exact default-path uniform-field RGB reference in encoded light.
+
+    ``rgb`` is an encoded RGB triple in 0..1. ``mask_mult`` is the shader's
+    LINEAR-light mask value for one output pixel (a scalar is broadcast).  The
+    return value is an encoded RGB tuple after the default CGWG-mask ordering,
+    brightboost, ordinary glow, ``pr_scan``, and output gamma.
+
+    Unlike :func:`ref_vertical`, this path retains Guest's chroma-dependent
+    scanline term.  Beam saturation is evaluated per channel, but beam
+    brightness, weight normalization, brightboost, glow mix, and scanline
+    preservation all use the shared maximum RGB exactly as the source does.
+    The temporal AfterglowPass is intentionally excluded because MiSTer's
+    scaler has no previous-frame buffer; the 2026-07-23 0.5/255 subtraction
+    therefore does not affect this static spatial evaluator.
+    """
+    f = abs(float(f))
+    encoded = _vec3(rgb, "rgb", unit_interval=True)
+    cmask = _vec3(mask_mult, "mask_mult")
+    linear = tuple(_lin(v) for v in encoded)
+    peak = max(linear)
+    eps = 1.0e-10
+
+    # Main CRT pass.  On a uniform field color1==color2==linear, while the
+    # saturation vector still differs per channel for non-neutral colors.
+    chroma = tuple(v / (peak + eps) for v in linear)
+    tmp = 1.30 + (1.00 - 1.30) * peak
+    shape1 = _beam_shape(f)
+    shape2 = _beam_shape(1.0 - f)
+    weights1 = []
+    weights2 = []
+    for c in chroma:
+        sat = 1.0 + DEFAULTS["scans_effective"] * (1.0 - c)
+        weights1.append(2.0 ** (-shape1 * (f * tmp) ** 2 * sat))
+        weights2.append(2.0 ** (-shape2 * ((1.0 - f) * tmp) ** 2 * sat))
+    norm = max(a + b for a, b in zip(weights1, weights2))
+    if norm > 1.0:
+        weights1 = [v / norm for v in weights1]
+        weights2 = [v / norm for v in weights2]
+
+    # gc(color) at gamma_c=1.  Keep the literal epsilon used by the shader.
+    gc_scale = peak / (peak + eps)
+    color = [linear[i] * gc_scale * (weights1[i] + weights2[i])
+             for i in range(3)]
+    color = [min(v, 1.0) for v in color]
+
+    # Deconvergence pass metadata is scalar/shared even for chromatic inputs.
+    cm = max(color)
+    colmx = max(peak, cm)
+    w3 = min((max((cm - 0.0005) * 1.0005, 0.0) + 0.0001)
+             / (colmx + 0.0005), 1.0)
+    mx = max(peak, cm) ** (1.40 / GAMMA_IN)
+
+    # Default mask_gamma==gamma_in, so the mask multiply is directly in linear
+    # light.  It precedes shared brightboost and the ordinary-glow add.
+    color = [min(color[i] * cmask[i], 1.0) for i in range(3)]
+    a = max(min(max(1.10 + (0.30 - 1.10) * mx, 0.0), 1.0) - 1.0, 0.0) + 1.0
+    dark_compensate = a * (1.0 - mx) + mx
+    brightboost = (1.40 + (1.10 - 1.40) * mx) * dark_compensate
+    color = [min(v * brightboost, 1.0) for v in color]
+
+    glow = [linear[i] * (1.0 - colmx) + 0.25 * color[i] * colmx
+            for i in range(3)]
+    color = [min(color[i] + 0.5 * DEFAULTS["glow"] * glow[i], 1.0)
+             for i in range(3)]
+
+    preserve = 1.0 + DEFAULTS["pr_scan"] * (
+        (0.5 * (1.0 + w3)) * (1.0 - mx) + w3 * mx - 1.0)
+    return tuple(min(max(v * preserve, 0.0), 1.0) ** (1.0 / GAMMA_OUT)
+                 for v in color)
+
+
 def ref_vertical(f, x, mask_mult=1.0):
     """Encoded (0..1) output at vertical fraction f within one scanline period
     (f=0 beam center, f=0.5 midway between lines) for a uniform encoded input
@@ -168,56 +260,14 @@ def ref_vertical(f, x, mask_mult=1.0):
                       pr_scan: color *= mix(1, mix(0.5*(1+w3), w3, mx), 0.10)
                       out = color^(1/2.4)
     """
-    f = abs(f)
-    E = _lin(x)
-
-    # --- main CRT pass scanline weights (uniform field: creff1 = creff2 = E) ---
-    w1 = _sw0_gray(f, E)          # line at distance f,   shape1 = mix(6,8,f)
-    w2 = _sw0_gray(1.0 - f, E)    # line at distance 1-f, shape2 = mix(6,8,1-f)
-    W = w1 + w2
-    if W > 1.0:                   # "if (wf1 > 1.0) {wf1 = 1.0/wf1; w1*=wf1, w2*=wf1;}"
-        W = 1.0
-
-    color = E * W                 # gc() identity (gamma_c = 1)
-    color = min(color, 1.0)
-    alpha = E                     # FragColor.a = colmx = maxrgb(ctmp) = E
-
-    # --- deconvergence pass ---
-    cm = color                    # igc(maxrgb) with gamma_c=1
-    colmx = max(alpha, cm)
-    w3 = min((max((cm - 0.0005) * 1.0005, 0.0) + 0.0001) / (colmx + 0.0005), 1.0)
-
-    mxg = max(alpha, cm)          # neighborhood alphas all == E on uniform field
-    mx = mxg ** (1.40 / GAMMA_IN)
-
-    # mask application (mask_gamma == gamma_in -> plain linear multiply)
-    color = min(color * mask_mult, 1.0)
-
-    # dark compensate (shadowMask=0 -> mwidths[0]=2.0 -> mask_compensate = 0.0):
-    #   mix(max(clamp(mix(mcut,maskstr,mx),0,1) - 1 + mask_compensate, 0) + 1, 1, mx)
-    # The shader clamps mix(1.10, 0.3, mx) to [0,1] BEFORE subtracting 1, so
-    # with mask_compensate = 0 the max() term is identically 0 and dc == 1.0.
-    # (An earlier revision of this module dropped the upper clamp, boosting
-    # near-black targets by up to 10%; keep the literal expression so any
-    # future mcut/maskstr/mask edits stay faithful.)
-    a = max(min(max(1.10 + (0.3 - 1.10) * mx, 0.0), 1.0) - 1.0 + 0.0, 0.0) + 1.0
-    dc = a * (1.0 - mx) + mx
-    bb = (1.40 + (1.10 - 1.40) * mx) * dc
-    color = min(color * bb, 1.0)
-
-    # bloom=0, halation=0, gamma_c2=1 (gc2 identity), smoothmask=0 -> skipped
-
-    # ordinary glow, glow = 0.08 (GlowPass value on a uniform field == E)
-    glow_v = E * (1.0 - colmx) + 0.25 * color * colmx   # mix(Glow, 0.25*color, colmx)
-    color = min(color + 0.5 * 0.08 * glow_v, 1.0)
-
-    # pr_scan = 0.10 scanline preservation
-    pr = 1.0 + 0.10 * ((0.5 * (1.0 + w3)) * (1.0 - mx) + w3 * mx - 1.0)
-    color *= pr
-
-    # mclip=0 / bmask=0 / noise / humbar / corner / vignette / post_br -> identity
-    color = min(max(color, 0.0), 1.0)
-    return color ** (1.0 / GAMMA_OUT)
+    # fitting._ref_vertical probes an optional third positional channel name.
+    # Guest's neutral response is channel-independent, so accept that generic
+    # protocol without confusing it with this module's historical mask scalar.
+    if isinstance(mask_mult, str):
+        if mask_mult not in "rgb":
+            raise ValueError(f"unknown channel {mask_mult!r}")
+        return ref_vertical_rgb(f, (x, x, x))["rgb".index(mask_mult)]
+    return ref_vertical_rgb(f, (x, x, x), mask_mult)[0]
 
 
 def h_kernel(frac):
@@ -290,6 +340,20 @@ def mask_spec():
     }
 
 
+def ref_masked(f, x, px, py, channel):
+    """Exact neutral source output through the default linear-light CGWG mask.
+
+    The generic encoded-multiplier shortcut is not exact here: Guest applies
+    its mask before shared brightboost, ordinary glow and the final 2.4 encode.
+    Keep neutral fitting on the same literal ordering as ref_vertical_rgb().
+    """
+    index = "rgb".index(channel)
+    tile = mask_spec()["linear_multipliers"]
+    multiplier = tile[int(px) % len(tile)]
+    level = min(max(float(x), 0.0), 1.0)
+    return ref_vertical_rgb(f, (level,) * 3, multiplier)[index]
+
+
 def notes():
     return [
         "VERTICAL BEAM IS 2-TAP: only the two nearest source lines contribute (support |d|<=1). "
@@ -321,8 +385,10 @@ def notes():
         "Not representable; small (<=e.g. gain diff 1.4 vs 1.1 confined to 1px transitions).",
         "pr_scan=0.10 'preserve scanline properties' post-multiply is included in ref_vertical; "
         "it deepens troughs by up to ~5% and is representable inside the V-FIR fit.",
-        "Afterglow (AS=0.20): temporal phosphor decay on pixels darker than ~3% encoded; "
-        "static-field magnitude <=0.001 linear. NOT representable (temporal). Negligible.",
+        "Afterglow (AS=0.20): temporal phosphor decay is NOT representable because MiSTer's "
+        "scaler has no previous-frame buffer. The 2026-07-23 source changed its near-black "
+        "subtraction from 1.25/255 to 0.5/255; this is the one non-neutral default-path delta "
+        "from the 2026-07-15 libretro pin and is deliberately excluded from this static model.",
         "avg-lum raster bloom: BLOOM=0 at defaults -> geometry static, only feeds OS overscan "
         "factor = 1.0. No effect.",
         "Interlace handling (interm=1, trigger 375 lines): 480i+ content gets field-blended "
@@ -355,11 +421,12 @@ def _validate(verbose=True):
     # w3~1 -> pr=1; out=0.250319^(1/2.4)=0.561523
     E = 0.5 ** 2.4
     mx = E ** (1.4 / 2.4)
-    c1 = E * (1.4 - 0.3 * mx)
+    cm = E * E / (E + 1.0e-10)
+    c1 = cm * (1.4 - 0.3 * mx)
     g = E * (1 - E) + 0.25 * c1 * E
     c2 = c1 + 0.04 * g
-    # w3 at f=0: cm=E (W=1), w3=min(((E-0.0005)*1.0005+0.0001)/(E+0.0005),1)
-    w3 = min((max((E - 0.0005) * 1.0005, 0) + 0.0001) / (E + 0.0005), 1.0)
+    # w3 at f=0 uses gc(E)=E*E/(E+eps), while alpha remains E.
+    w3 = min((max((cm - 0.0005) * 1.0005, 0) + 0.0001) / (E + 0.0005), 1.0)
     pr = 1 + 0.1 * ((0.5 * (1 + w3)) * (1 - mx) + w3 * mx - 1)
     expect = (c2 * pr) ** (1 / 2.4)
     checks.append(("transfer(0.5)", transfer(0.5), expect, 1e-12))
@@ -371,10 +438,11 @@ def _validate(verbose=True):
     # w3=((E-.0005)*1.0005+.0001)/(E+.0005); pr=1+0.1*(0.5*(1+w3)*(1-mx)+w3*mx-1)
     E = 0.1 ** 2.4
     mx = 0.1 ** 1.4
-    c1 = E * (1.4 - 0.3 * mx)
+    cm = E * E / (E + 1.0e-10)
+    c1 = cm * (1.4 - 0.3 * mx)
     g = E * (1 - E) + 0.25 * c1 * E
     c2 = c1 + 0.04 * g
-    w3 = min((max((E - 0.0005) * 1.0005, 0) + 0.0001) / (E + 0.0005), 1.0)
+    w3 = min((max((cm - 0.0005) * 1.0005, 0) + 0.0001) / (E + 0.0005), 1.0)
     pr = 1 + 0.1 * ((0.5 * (1 + w3)) * (1 - mx) + w3 * mx - 1)
     expect = (c2 * pr) ** (1 / 2.4)
     checks.append(("transfer(0.1) dc==1", transfer(0.1), expect, 1e-12))
@@ -387,9 +455,11 @@ def _validate(verbose=True):
                    2 ** (-7 * 0.65 ** 2), 1e-12))
 
     # 5) ref_vertical(0.5, 1.0) hand: W=2*2^-1.75=0.594604; cm=W; w3=(W-.0005)*1.0005+.0001)/1.0005
-    W = 2 * 2 ** -1.75
-    w3 = min((max((W - 0.0005) * 1.0005, 0) + 0.0001) / (1.0 + 0.0005), 1.0)
-    c = min(W * 1.1, 1.0)
+    sat = 1.0 + 0.75 * (1.0 - 1.0 / (1.0 + 1.0e-10))
+    W = 2 * 2 ** (-1.75 * sat)
+    cm = W / (1.0 + 1.0e-10)
+    w3 = min((max((cm - 0.0005) * 1.0005, 0) + 0.0001) / (1.0 + 0.0005), 1.0)
+    c = min(cm * 1.1, 1.0)
     gl = 1.0 * 0.0 + 0.25 * c * 1.0
     c = min(c + 0.04 * gl, 1.0)
     pr = 1 + 0.1 * (w3 - 1)      # mx=1

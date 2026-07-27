@@ -23,12 +23,14 @@ import quantize
 
 PHASES = 256
 LUMA_W = np.array([0.2126, 0.7152, 0.0722])
-# Preserve the dense near-black region: Kurozumi deliberately lifts black and
-# colours that lift, so starting every objective at code 8 erases a visible
-# part of the preset.  The remainder keeps the 4-code sampling cost while
-# codes 253..255 explicitly cover the peak-white endpoint that grid omits.
+# Preserve the dense near-black region: historical Kurozumi has an explicit
+# RGBA8 Grade quantization boundary and true code-zero, so starting every
+# objective at code 8 can hide a visible toe/black regression.  The remainder
+# keeps the 4-code sampling cost while codes 253..255 cover peak white.
 EVAL_CODES = np.concatenate((np.arange(0, 8), np.arange(8, 256, 4),
                              np.arange(253, 256)))
+RGB_EVAL_LEVELS = np.array([0, 32, 64, 96, 128, 160, 192, 224, 255],
+                           dtype=np.int64)
 
 
 def gamma_stats(lut: np.ndarray) -> dict[str, int]:
@@ -226,6 +228,128 @@ def rmse_exact_rgb(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
     return float(np.sqrt(np.mean(e * e)))
 
 
+def rgb_cube(levels: np.ndarray | None = None,
+             exclude_black: bool = True) -> np.ndarray:
+    """Return a deterministic encoded-RGB cube as an ``(N, 3)`` code array."""
+    if levels is None:
+        levels = RGB_EVAL_LEVELS
+    levels = np.asarray(levels, dtype=np.int64)
+    if levels.ndim != 1 or not len(levels) or np.any((levels < 0) | (levels > 255)):
+        raise ValueError("RGB levels must be a non-empty 1-D array in 0..255")
+    colors = np.array(np.meshgrid(levels, levels, levels, indexing="ij"),
+                      dtype=np.int64).reshape(3, -1).T
+    if exclude_black:
+        colors = colors[np.any(colors != 0, axis=1)]
+    return colors
+
+
+def rgb_masked_metrics(ref, dark: np.ndarray, bright: np.ndarray,
+                       h: np.ndarray, lut: np.ndarray,
+                       tokens: list[list[str]],
+                       levels: np.ndarray | None = None,
+                       phases: np.ndarray | None = None,
+                       rgbs: np.ndarray | None = None,
+                       align: bool = True,
+                       mask_scale: int = 1,
+                       reference_period: tuple[int, int] | None = None) -> dict:
+    """Exact masked uniform-RGB fidelity against a source-side RGB evaluator.
+
+    This is the chromatic companion to :func:`rmse_exact_masked`.  It exercises
+    a full RGB cube instead of a neutral ramp, drives MiSTer's adaptive V filter
+    from the shared post-H maximum RGB, and applies both masks in their native
+    arithmetic/order.  The reference must publish ``ref_vertical_rgb(f, rgb,
+    mask_mult)``; in particular, this lets Guest apply its linear-light mask
+    before brightboost/glow instead of approximating it as an encoded multiply.
+
+    Returns a dictionary with ``rms``, ``max``, ``roll``, ``colors``, and
+    ``samples``.  The default validation domain is the endpoint-inclusive
+    9-level cube (black excluded), 33 half-phases, both mask cells, and RGB.
+    """
+    import fileio
+
+    rgb_fn = getattr(ref, "ref_vertical_rgb", None)
+    if rgb_fn is None:
+        raise AttributeError("reference does not publish ref_vertical_rgb")
+    colors = rgb_cube(levels) if rgbs is None else np.asarray(rgbs, dtype=np.int64)
+    if colors.ndim != 2 or colors.shape[1] != 3 \
+            or np.any((colors < 0) | (colors > 255)):
+        raise ValueError("rgbs must have shape (N, 3) with codes in 0..255")
+    if phases is None:
+        phases = np.arange(0, 33, dtype=np.float64) / 64.0
+    phases = np.asarray(phases, dtype=np.float64)
+    if phases.ndim != 1 or not len(phases) or np.any(~np.isfinite(phases)):
+        raise ValueError("phases must be a non-empty finite 1-D array")
+    if mask_scale not in (1, 2):
+        raise ValueError(f"mask_scale must be 1 or 2, got {mask_scale}")
+
+    linear_mask = mask_linear_tile(ref)
+    if reference_period is not None:
+        ph, pw = map(int, reference_period)
+        if ph <= 0 or pw <= 0 or ph > linear_mask.shape[0] \
+                or pw > linear_mask.shape[1]:
+            raise ValueError("reference_period must fit inside the source mask")
+        # Project tiny source-resize noise onto its physically visible cadence.
+        # Kurozumi's 16x16 Lanczos tile is vertically flat and horizontally a
+        # two-pixel R/B alternation at 1080p; averaging modulo (1,2) preserves
+        # that exact macrostructure without scoring 256 near-duplicate cells.
+        projected = np.zeros((ph, pw, 3), dtype=np.float64)
+        counts = np.zeros((ph, pw, 1), dtype=np.float64)
+        for yy in range(linear_mask.shape[0]):
+            for xx in range(linear_mask.shape[1]):
+                projected[yy % ph, xx % pw] += linear_mask[yy, xx]
+                counts[yy % ph, xx % pw, 0] += 1.0
+        linear_mask = projected / counts
+    rh, rw, _ = linear_mask.shape
+    mask = fileio.MaskFile([], len(tokens[0]), len(tokens), tokens)
+    m16 = np.round(mask.multipliers() * 16.0).astype(np.int64)
+    if mask_scale == 2:
+        m16 = np.repeat(np.repeat(m16, 2, axis=0), 2, axis=1)
+    mh, mw, _ = m16.shape
+    super_h = int(np.lcm(mh, rh))
+    super_w = int(np.lcm(mw, rw))
+    sse = np.zeros((super_h, super_w), dtype=np.float64)
+
+    def pair(rgb):
+        simulated = simulate_uniform_rgb(dark, bright, h, lut, rgb, phases)
+        port = mm.mask_multiply(simulated[None, None, :, :],
+                                m16[:, :, None, :])
+        port = np.tile(port, (super_h // mh, super_w // mw, 1, 1))
+        encoded = np.asarray(rgb, dtype=np.float64) / 255.0
+        target = np.empty((rh, rw, len(phases), 3), dtype=np.float64)
+        for yy in range(rh):
+            for xx in range(rw):
+                target[yy, xx] = 255.0 * np.array([
+                    rgb_fn(float(f), encoded, linear_mask[yy, xx])
+                    for f in phases], dtype=np.float64)
+        target = np.tile(target, (super_h // rh, super_w // rw, 1, 1))
+        return port, target
+
+    for rgb in colors:
+        port, target = pair(rgb)
+        fp = np.fft.fft2(port, axes=(0, 1))
+        ft = np.fft.fft2(target, axes=(0, 1))
+        corr = np.fft.ifft2(fp * np.conj(ft), axes=(0, 1)).real
+        sse += ((port * port).sum() + (target * target).sum()
+                - 2.0 * corr.sum(axis=(2, 3)))
+    if align:
+        # The source tile has only rh*rw distinct rigid rolls even when the
+        # source/hardware LCM supercell is larger.
+        unique = sse[:rh, :rw]
+        dy, dx = np.unravel_index(int(np.argmin(unique)), unique.shape)
+    else:
+        dy, dx = 0, 0
+    count = len(colors) * super_h * super_w * len(phases) * 3
+    rms = float(np.sqrt(max(sse[dy, dx], 0.0) / count))
+
+    max_error = 0.0
+    for rgb in colors:
+        port, target = pair(rgb)
+        target = np.roll(target, (dy, dx), axis=(0, 1))
+        max_error = max(max_error, float(np.abs(port - target).max()))
+    return {"rms": rms, "max": max_error, "roll": (int(dy), int(dx)),
+            "colors": int(len(colors)), "samples": int(count)}
+
+
 def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
                       lut: np.ndarray, tokens: list[list[str]],
                       mask_encoded: np.ndarray,
@@ -241,8 +365,10 @@ def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
         white differ by tens of codes.
       * gain-split — when gain lives in the mask (G), a mask-off measurement is
         G times dark by construction and rises with G, which is backwards.
-    Target: 255 * min(B(f,x) * m_encoded, 1) per mask pixel and channel, where
-    B is the pre-clip beam.
+    Target: the reference module's exact ``ref_masked`` result when available.
+    This matters for piecewise transfer functions such as sRGB, where applying a
+    linear-light mask is signal-dependent in encoded space.  References without
+    that hook retain the power-law-equivalent ``min(B*m_encoded, 1)`` path.
 
     align=True scores every rigid roll of the reference tile and keeps the best.
     A mask tile shifted by a few output pixels is the SAME mask to the eye (the
@@ -258,6 +384,35 @@ def rmse_exact_masked(ref, dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
         ref, dark, bright, h, lut, tokens, mask_encoded, codes=codes,
         align=align, mask_scale=mask_scale)
     return rmse, max_err
+
+
+def masked_reference_tile(ref, fs: np.ndarray, code: int,
+                          mask_encoded: np.ndarray) -> np.ndarray:
+    """Return exact source output ``(mask_y, mask_x, phase, RGB)`` in codes.
+
+    A source module may expose ``ref_masked(f, x, px, py, channel)`` to model
+    the complete mask application and final transfer.  The fallback is exact
+    for a pure-power output encode and preserves existing family behavior.
+    ``mask_encoded`` still supplies the reference period and the fallback tile.
+    """
+    fs = np.asarray(fs, dtype=np.float64)
+    tile = np.asarray(mask_encoded, dtype=np.float64)
+    if tile.ndim != 3 or tile.shape[2] != 3:
+        raise ValueError("mask_encoded must have shape (height, width, 3)")
+    h_tile, w_tile, _ = tile.shape
+    x = int(code) / 255.0
+    hook = getattr(ref, "ref_masked", None)
+    if hook is not None:
+        return 255.0 * np.array([
+            [[
+                [hook(float(f), x, px, py, channel) for channel in "rgb"]
+                for f in fs]
+             for px in range(w_tile)]
+            for py in range(h_tile)
+        ], dtype=np.float64)
+    beam = np.array([[_ref_vertical_unclipped(ref, f, x, channel)
+                      for channel in "rgb"] for f in fs])
+    return 255.0 * np.minimum(tile[:, :, None, :] * beam[None, None, :, :], 1.0)
 
 
 def _rmse_exact_masked_periodic(
@@ -315,10 +470,7 @@ def _rmse_exact_masked_periodic(
         port = mm.mask_multiply(v[None, None, :, :], m16[:, :, None, :])
         port = np.tile(port, (super_h // mh, super_w // mw, 1, 1))
 
-        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
-                       for ch in "rgb"] for f in fs])
-        target = 255.0 * np.minimum(
-            mask_encoded[:, :, None, :] * b[None, None, :, :], 1.0)
+        target = masked_reference_tile(ref, fs, int(code), mask_encoded)
         target = np.tile(target,
                          (super_h // h_tile, super_w // w_tile, 1, 1))
 
@@ -357,10 +509,7 @@ def _rmse_exact_masked_periodic(
         v = np.stack(per_ch, axis=1)
         port = mm.mask_multiply(v[None, None, :, :], m16[:, :, None, :])
         port = np.tile(port, (super_h // mh, super_w // mw, 1, 1))
-        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
-                       for ch in "rgb"] for f in fs])
-        target = 255.0 * np.minimum(
-            mask_encoded[:, :, None, :] * b[None, None, :, :], 1.0)
+        target = masked_reference_tile(ref, fs, int(code), mask_encoded)
         target = np.tile(target,
                          (super_h // h_tile, super_w // w_tile, 1, 1))
         target = np.roll(target, (dy, dx), axis=(0, 1))
@@ -398,22 +547,19 @@ def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
     super_h = int(np.lcm(mh, h_tile))
     super_w = int(np.lcm(mw, w_tile))
     mults = np.empty((super_h * super_w, 3), dtype=np.int64)
-    encoded = np.empty((super_h * super_w, 3), dtype=np.float64)
+    reference_cells = np.empty((super_h * super_w, 2), dtype=np.int64)
     k = 0
     for yy in range(super_h):
         for xx in range(super_w):
             mults[k] = m16[yy % mh, xx % mw]
-            encoded[k] = mask_encoded[(yy - dy) % h_tile,
-                                      (xx - dx) % w_tile]
+            reference_cells[k] = ((yy - dy) % h_tile, (xx - dx) % w_tile)
             k += 1
     lines = np.empty(16, dtype=np.int64)
     out = lut.copy()
     for code in range(256):
         x = code / 255.0
-        b = np.array([[_ref_vertical_unclipped(ref, f, x, ch)
-                       for ch in "rgb"] for f in fs])
-        targets = 255.0 * np.minimum(
-            b[None, :, :] * encoded[:, None, :], 1.0)
+        reference = masked_reference_tile(ref, fs, code, mask_encoded)
+        targets = reference[reference_cells[:, 0], reference_cells[:, 1]]
         base = lut[code].astype(np.int64)
         best = base.copy()
 
@@ -432,9 +578,9 @@ def refine_lut_masked(ref, lut: np.ndarray, h: np.ndarray, dark: np.ndarray,
             return float(((sim - targets) ** 2).sum())
 
         if channel_aware:
-            # Coordinate descent over a true RGB LUT vector.  Kurozumi's warm
-            # black flare cannot be represented by the old scalar base+delta
-            # search, which forced every refined entry toward neutral gray.
+            # Coordinate descent over a true RGB LUT vector.  Kurozumi's P22
+            # color transform cannot be represented by the old scalar
+            # base+delta search, which forced every entry toward neutral gray.
             best_err = candidate_error(best)
             for _ in range(2):
                 changed = False
@@ -574,6 +720,38 @@ def mask_encoded_tile(ref) -> np.ndarray:
             if lin.ndim == 2:
                 lin = lin[None, :, :]
             return np.clip(lin, 0.0, None) ** (1.0 / gamma)
+    raise KeyError(f"mask_spec() has no recognized multiplier key: {sorted(spec)}")
+
+
+def mask_linear_tile(ref) -> np.ndarray:
+    """Return a reference mask as a native linear-light ``(h, w, 3)`` tile.
+
+    RGB-aware references need this representation because mask ordering can be
+    nonlinear: Guest applies the mask before shared brightboost and glow.  If a
+    reference publishes only an encoded-equivalent tile, invert its declared
+    output gamma as a conservative fallback.
+    """
+    spec = ref.mask_spec()
+    for key in ("linear_multipliers", "tile_linear_multiplier"):
+        if key in spec:
+            tile = np.asarray(spec[key], dtype=np.float64)
+            if tile.ndim == 2:
+                tile = tile[None, :, :]
+            if tile.ndim != 3 or tile.shape[2] != 3:
+                raise ValueError(f"{key} must describe an (h, w, 3) RGB tile")
+            return np.clip(tile, 0.0, None)
+    if "tile_rgb_0_255" in spec:
+        tile = (np.asarray(spec["tile_rgb_0_255"], dtype=np.float64) / 255.0
+                * float(spec.get("mask_amplify", 1.0)))
+        if tile.ndim == 2:
+            tile = tile[None, :, :]
+        return np.clip(tile, 0.0, None)
+    for key in ("encoded_equivalent_multipliers", "tile_encoded_multiplier"):
+        if key in spec:
+            tile = np.asarray(spec[key], dtype=np.float64)
+            if tile.ndim == 2:
+                tile = tile[None, :, :]
+            return np.clip(tile, 0.0, None) ** _output_gamma(ref)
     raise KeyError(f"mask_spec() has no recognized multiplier key: {sorted(spec)}")
 
 
@@ -841,6 +1019,52 @@ def _solve_ab(O: np.ndarray, g: np.ndarray, cap_a: np.ndarray, cap_b: np.ndarray
     return A, B
 
 
+def _solve_ab_linear_box(O: np.ndarray, p: np.ndarray, q: np.ndarray,
+                         weights: np.ndarray, cap_a: np.ndarray,
+                         cap_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Weighted two-feature least squares with exact per-phase box bounds.
+
+    The RGB fit has independent signal and shared-control levels, so its
+    features are not reducible to :func:`_joint_features`.  With clipping
+    excluded by the caller's behavioural gate, the objective is convex.  Its
+    optimum is either the unconstrained solution or lies on one of four box
+    edges; enumerating those candidates is exact and much cheaper than a grid.
+    """
+    O = np.asarray(O, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    if O.ndim != 2 or p.shape != (O.shape[1],) or q.shape != p.shape \
+            or weights.shape != p.shape:
+        raise ValueError("O/features/weights have incompatible shapes")
+    wp, wq = weights * p, weights * q
+    pp, pq, qq = float(wp @ p), float(wp @ q), float(wq @ q)
+    determinant = pp * qq - pq * pq
+    A = np.empty(O.shape[0], dtype=np.float64)
+    B = np.empty(O.shape[0], dtype=np.float64)
+    for phase in range(O.shape[0]):
+        target = O[phase]
+        po, qo = float(wp @ target), float(wq @ target)
+        candidates = []
+        if determinant > 1.0e-15:
+            au = (po * qq - qo * pq) / determinant
+            bu = (qo * pp - po * pq) / determinant
+            if 0.0 <= au <= cap_a[phase] and 0.0 <= bu <= cap_b[phase]:
+                candidates.append((au, bu))
+        for av in (0.0, float(cap_a[phase])):
+            bv = np.clip((qo - av * pq) / max(qq, 1.0e-15),
+                         0.0, cap_b[phase])
+            candidates.append((av, float(bv)))
+        for bv in (0.0, float(cap_b[phase])):
+            av = np.clip((po - bv * pq) / max(pp, 1.0e-15),
+                         0.0, cap_a[phase])
+            candidates.append((float(av), bv))
+        costs = [float(weights @ ((av * p + bv * q - target) ** 2))
+                 for av, bv in candidates]
+        A[phase], B[phase] = candidates[int(np.argmin(costs))]
+    return A, B
+
+
 def _dp_g(O: np.ndarray, A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """EXACT optimal monotone integer warp given (A, B).
 
@@ -942,6 +1166,105 @@ def fit_v_for_lut_safe(ref, lut: np.ndarray, limit: float = 255.5,
     return last
 
 
+def fit_v_for_lut_rgb_safe(ref, lut: np.ndarray,
+                           neutral_weight: float = 4.0,
+                           rgb_weight: float = 1.0,
+                           rgb_levels: np.ndarray | None = None,
+                           limit: float = 255.5,
+                           caps=(256.0, 252.0, 248.0, 244.0, 240.0, 232.0)
+                           ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Fit shared adaptive V endpoints to a Pareto mix of gray and RGB fields.
+
+    For a signal channel ``s`` driven by MiSTer's shared maximum-RGB control
+    ``g``, the unclipped flat-field model is linear in endpoint row sums::
+
+        out = A * s*(256-g)/65536 + B * s*g/65536
+
+    A dense neutral ramp and a chromatic cube are assigned independent total
+    weights, so increasing ``neutral_weight`` traces a useful fidelity Pareto
+    frontier instead of letting the much larger RGB cube swamp gray quality.
+    The source target comes from ``ref_vertical_rgb`` with its mask disabled.
+    Quantization and the measured no-clipping gate match the gray-only fitter.
+    """
+    rgb_fn = getattr(ref, "ref_vertical_rgb", None)
+    if rgb_fn is None:
+        raise AttributeError("reference does not publish ref_vertical_rgb")
+    if neutral_weight <= 0.0 or rgb_weight <= 0.0:
+        raise ValueError("neutral_weight and rgb_weight must be positive")
+    if rgb_levels is None:
+        rgb_levels = np.array([0, 64, 128, 192, 255], dtype=np.int64)
+    colors = rgb_cube(rgb_levels)
+    colors = colors[~np.all(colors == colors[:, :1], axis=1)]
+    fs = np.arange(0, 33, dtype=np.float64) / 64.0
+
+    targets, p_features, q_features, groups = [], [], [], []
+    for code in EVAL_CODES:
+        signal = int(lut[int(code), 1])
+        control = int(lut[int(code)].max())
+        if signal == 0:
+            continue
+        targets.append(np.array([
+            255.0 * rgb_fn(float(f), (code / 255.0,) * 3)[1]
+            for f in fs], dtype=np.float64))
+        p_features.append(signal * (256 - control) / 65536.0)
+        q_features.append(signal * control / 65536.0)
+        groups.append(0)
+    for rgb in colors:
+        gamma = np.array([lut[int(rgb[c]), c] for c in range(3)], dtype=np.int64)
+        control = int(gamma.max())
+        source = np.asarray(rgb, dtype=np.float64) / 255.0
+        reference = np.array([rgb_fn(float(f), source) for f in fs],
+                             dtype=np.float64)
+        for channel, signal in enumerate(gamma):
+            if signal == 0:
+                continue
+            targets.append(255.0 * reference[:, channel])
+            p_features.append(int(signal) * (256 - control) / 65536.0)
+            q_features.append(int(signal) * control / 65536.0)
+            groups.append(1)
+    O = np.stack(targets, axis=1)
+    p = np.asarray(p_features, dtype=np.float64)
+    q = np.asarray(q_features, dtype=np.float64)
+    groups = np.asarray(groups, dtype=np.int64)
+    neutral_count = max(int(np.count_nonzero(groups == 0)), 1)
+    rgb_count = max(int(np.count_nonzero(groups == 1)), 1)
+    weights = np.where(groups == 0, neutral_weight / neutral_count,
+                       rgb_weight / rgb_count)
+
+    shapes = _endpoint_shapes(ref)
+    cap_a129 = np.minimum(511.0 / np.maximum(shapes[0].max(axis=1), 1e-9),
+                         2044.0)
+    cap_a = np.interp(fs, np.arange(129) / 256.0, cap_a129)
+    last = None
+    for cap_bright in caps:
+        A, B = _solve_ab_linear_box(
+            O, p, q, weights, cap_a, np.full(len(fs), cap_bright))
+        tables = []
+        for sums33, shape in ((A, shapes[0]), (B, shapes[1])):
+            sums129 = np.interp(np.arange(129) / 256.0, fs, sums33)
+            fl = np.zeros((PHASES, 4), dtype=np.float64)
+            fl[:129] = sums129[:, None] * shape
+            for phase in range(129, PHASES):
+                fl[phase] = fl[PHASES - phase][::-1]
+            fl = np.clip(fl, 0.0, None)
+            target_sums = np.rint(fl.sum(axis=1)).astype(np.int64)
+            for phase in range(1, 128):
+                target_sums[PHASES - phase] = target_sums[phase]
+            tables.append(quantize.quantize_symmetric(fl, target_sums))
+        dark, bright = tables
+        worst = worst_flat_field_output(lut, dark, bright)
+        last = (dark, bright, {
+            "cap_bright": cap_bright, "worst_flat": worst,
+            "neutral_weight": float(neutral_weight),
+            "rgb_weight": float(rgb_weight),
+            "neutral_observations": neutral_count,
+            "rgb_observations": rgb_count,
+        })
+        if worst <= limit:
+            return last
+    return last
+
+
 def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
                 iters: int = 25, channels: bool = False,
                 seed: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1023,9 +1346,8 @@ def fit_v_joint(ref, xs: np.ndarray | None = None, cap_bright: float = 256.0,
 
     gf = np.interp(np.arange(256), xs_i, g)
     gf = np.maximum.accumulate(np.clip(np.round(gf), 0, 255))
-    # Do not erase a deliberate lifted black.  Kurozumi's grade pass has a
-    # warm channel-dependent flare at code 0; zero is only a required anchor
-    # for references whose own black is actually zero.
+    # Preserve a deliberate lift only when the reference explicitly has one;
+    # historical Kurozumi resolves its intended/practical black to true zero.
     if max(_transfer(ref, 0.0, c) for c in "rgb") <= 1e-9:
         gf[0] = 0
     lut = np.zeros((256, 3), dtype=np.int64)
@@ -1062,6 +1384,214 @@ def worst_flat_field_output(lut: np.ndarray, dark: np.ndarray,
             worst = max(
                 worst, float((int(signal) * row_sums / 32768.0).max()))
     return worst
+
+
+def adaptive_moire_1080(dark: np.ndarray, bright: np.ndarray,
+                        lut: np.ndarray,
+                        source_heights=(224, 240), output_lines: int = 1080,
+                        codes=(64, 128, 191, 255)) -> float:
+    """Worst exact peak/trough instability at common 1080p scale ratios."""
+    worst = 0.0
+    for code in codes:
+        for source_lines in source_heights:
+            scale = output_lines / source_lines
+            for channel in range(3):
+                profile = mm.flat_field_profile(
+                    int(code), scale, dark, bright, lut, n_out=output_lines,
+                    channel=channel)
+                metrics = mm.moire_metrics(profile, scale)
+                worst = max(worst, metrics["peak_std"], metrics["trough_std"])
+    return float(worst)
+
+
+def selector_control_jump(h: np.ndarray, dark: np.ndarray,
+                          bright: np.ndarray, lut: np.ndarray) -> int:
+    """Worst discontinuity caused solely by the nearest-line control switch."""
+    cases = (
+        ((64, 64, 64), (255, 255, 255)),
+        ((0, 0, 0), (255, 255, 255)),
+        ((255, 0, 0), (0, 0, 255)),
+        ((255, 64, 64), (64, 64, 255)),
+    )
+
+    def h_rgb(rgb):
+        return np.array([int(mm.fir_1d(
+            np.full(16, int(lut[int(rgb[c]), c]), dtype=np.int64),
+            h, np.array([8.0]))[0]) for c in range(3)], dtype=np.int64)
+
+    worst = 0
+    position = np.array([8.5], dtype=np.float64)
+    for upper_rgb, lower_rgb in cases:
+        upper, lower = h_rgb(upper_rgb), h_rgb(lower_rgb)
+        lines = np.empty((16, 3), dtype=np.int64)
+        lines[:9], lines[9:] = upper, lower
+        for channel in range(3):
+            before = mm.fir_1d_adaptive(
+                lines[:, channel], dark, bright, position,
+                np.array([upper.max()], dtype=np.int64))[0]
+            after = mm.fir_1d_adaptive(
+                lines[:, channel], dark, bright, position,
+                np.array([lower.max()], dtype=np.int64))[0]
+            worst = max(worst, abs(int(after) - int(before)))
+    return int(worst)
+
+
+def fit_v_rgb_pareto(ref, h: np.ndarray, tokens: list[list[str]],
+                     baseline: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+                     neutral_weights=(2.0, 4.0, 8.0),
+                     neutral_objective: float = 2.0,
+                     neutral_rms_limit: float = 2.6,
+                     neutral_max_limit: float = 12.0,
+                     rgb_rms_limit: float = 8.0,
+                     rgb_max_limit: float = 32.0,
+                     moire_limit: float = 7.65
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Select an RGB-aware gamma/V point on a measured fidelity frontier.
+
+    Guest's source beam narrows minority channels using chroma, while MiSTer's
+    single adaptive V control is shared max-RGB.  A gray-only gamma warp hides
+    shared brightboost in each LUT channel and is therefore badly wrong for
+    mixed colors.  This routine searches smooth hardware-legal gamma families,
+    fits each V pair with several explicit gray/RGB objective weights, then
+    chooses by exact masked RGB + neutral error under clipping, quantization,
+    selector-independent 1080p moire, and max-error constraints.
+    """
+    if baseline is None:
+        base_lut, base_dark, base_bright, _ = fit_v_joint_safe(ref)
+    else:
+        base_lut, base_dark, base_bright = baseline
+    base_lut = np.asarray(base_lut, dtype=np.int64)
+    identity = np.arange(256, dtype=np.float64)
+    base_curve = base_lut[:, 0].astype(np.float64)
+    curves = [("joint-baseline", base_lut.copy())]
+    for alpha in (0.35, 0.45, 0.55, 0.60, 0.65, 0.70, 0.75):
+        curve = np.rint((1.0 - alpha) * base_curve + alpha * identity)
+        curves.append((f"joint/identity {alpha:.2f}",
+                       np.repeat(curve[:, None], 3, axis=1).astype(np.int64)))
+    x = np.arange(256, dtype=np.float64) / 255.0
+    for power in (1.00, 1.025, 1.05, 1.075, 1.10, 1.125, 1.15):
+        curve = np.rint(255.0 * x ** power)
+        curves.append((f"power {power:.3f}",
+                       np.repeat(curve[:, None], 3, axis=1).astype(np.int64)))
+
+    unique_curves, seen = [], set()
+    for label, curve in curves:
+        curve = np.maximum.accumulate(np.clip(curve, 0, 255), axis=0)
+        key = curve.tobytes()
+        if key not in seen:
+            seen.add(key)
+            unique_curves.append((label, curve))
+    mask_encoded = mask_encoded_tile(ref)
+    score_levels = np.array([0, 64, 128, 192, 255], dtype=np.int64)
+    score_phases = np.arange(0, 9, dtype=np.float64) / 16.0
+    neutral_codes = np.unique(np.concatenate((np.arange(0, 256, 8),
+                                              np.array([253, 254, 255]))))
+    candidates = []
+    for label, curve in unique_curves:
+        variants = []
+        if label == "joint-baseline":
+            variants.append(("joint", base_dark.copy(), base_bright.copy(),
+                             {"worst_flat": worst_flat_field_output(
+                                 curve, base_dark, base_bright)}))
+        gray_dark, gray_bright, gray_info = fit_v_for_lut_safe(ref, curve)
+        variants.append(("gray-fixed", gray_dark, gray_bright, gray_info))
+        for weight in neutral_weights:
+            rgb_dark, rgb_bright, rgb_info = fit_v_for_lut_rgb_safe(
+                ref, curve, neutral_weight=float(weight), rgb_weight=1.0)
+            variants.append((f"rgb-n{weight:g}", rgb_dark, rgb_bright, rgb_info))
+        for variant, dark, bright, fit_info in variants:
+            if not gamma_quality_ok(curve) or fit_info["worst_flat"] > 255.5:
+                continue
+            neutral_rms, neutral_max = rmse_exact_masked(
+                ref, dark, bright, h, curve, tokens, mask_encoded,
+                codes=neutral_codes)
+            rgb = rgb_masked_metrics(
+                ref, dark, bright, h, curve, tokens, levels=score_levels,
+                phases=score_phases)
+            moire = adaptive_moire_1080(dark, bright, curve)
+            objective = rgb["rms"] + neutral_objective * neutral_rms
+            feasible = (neutral_rms <= neutral_rms_limit
+                        and neutral_max <= neutral_max_limit
+                        and rgb["rms"] <= rgb_rms_limit
+                        and rgb["max"] <= rgb_max_limit
+                        and moire <= moire_limit)
+            candidates.append({
+                "label": f"{label}; {variant}", "lut": curve,
+                "dark": dark, "bright": bright, "objective": objective,
+                "neutral_rms": neutral_rms, "neutral_max": neutral_max,
+                "rgb_rms": rgb["rms"], "rgb_max": rgb["max"],
+                "moire": moire, "worst_flat": fit_info["worst_flat"],
+                "feasible": feasible,
+            })
+    feasible = [candidate for candidate in candidates if candidate["feasible"]]
+    if not feasible:
+        summary = sorted(candidates, key=lambda candidate: candidate["objective"])[:3]
+        raise RuntimeError(f"no feasible RGB Pareto fit; best candidates: {summary}")
+    # An RGB-weighted endpoint fit is required for this path; gray-only variants
+    # remain in the report as a control showing whether the extra objective is
+    # buying anything, but cannot silently win by a few thousandths.
+    rgb_feasible = [candidate for candidate in feasible
+                    if "; rgb-" in candidate["label"]]
+    pool = rgb_feasible or feasible
+    best = min(pool, key=lambda candidate: (candidate["objective"],
+                                             candidate["rgb_rms"],
+                                             candidate["neutral_rms"]))
+    public = {key: value for key, value in best.items()
+              if key not in ("lut", "dark", "bright")}
+    public["evaluated"] = len(candidates)
+    public["feasible_count"] = len(feasible)
+    public["frontier"] = [{key: value for key, value in candidate.items()
+                           if key not in ("lut", "dark", "bright")}
+                          for candidate in sorted(
+                              feasible, key=lambda candidate: candidate["objective"])[:8]]
+    return best["lut"], best["dark"], best["bright"], public
+
+
+def constrain_selector_phase128(dark: np.ndarray, bright: np.ndarray,
+                                h: np.ndarray, lut: np.ndarray,
+                                limit: int = 16, radius: int = 12,
+                                score_fn=None,
+                                clip_limit: float = 255.5
+                                ) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Constrain the phase-128 selector artifact with a bounded symmetric fit.
+
+    Only the two centre coefficients of the self-symmetric half-phase rows are
+    searched.  This is the smallest possible intervention: all other phases,
+    endpoint beam shapes, and exact conjugacy remain untouched.  ``score_fn``
+    may provide a source-aware scalar score; otherwise coefficient movement is
+    minimized.  The returned candidate is behaviourally clip-safe.
+    """
+    d0 = np.asarray(dark, dtype=np.int64)
+    b0 = np.asarray(bright, dtype=np.int64)
+    if d0.shape != (PHASES, 4) or b0.shape != (PHASES, 4):
+        raise ValueError("adaptive tables must both have shape (256, 4)")
+    candidates = []
+    for delta_dark in range(-radius, radius + 1):
+        for delta_bright in range(-radius, radius + 1):
+            d = d0.copy()
+            b = b0.copy()
+            d[128, 1:3] += delta_dark
+            b[128, 1:3] += delta_bright
+            if np.any(d[128] < -512) or np.any(d[128] > 511) \
+                    or np.any(b[128] < -512) or np.any(b[128] > 511):
+                continue
+            selector = selector_control_jump(h, d, b, lut)
+            if selector > limit:
+                continue
+            score = (float(score_fn(d, b)) if score_fn is not None else
+                     float(delta_dark * delta_dark + delta_bright * delta_bright))
+            candidates.append((score, abs(delta_dark) + abs(delta_bright),
+                               selector, delta_dark, delta_bright, d, b))
+    for candidate in sorted(candidates, key=lambda item: item[:5]):
+        score, _, selector, delta_dark, delta_bright, d, b = candidate
+        worst = worst_flat_field_output(lut, d, b)
+        if worst <= clip_limit:
+            return d, b, {"selector": int(selector), "score": float(score),
+                          "delta_dark": int(delta_dark),
+                          "delta_bright": int(delta_bright),
+                          "worst_flat": float(worst),
+                          "candidates": len(candidates)}
+    raise RuntimeError(f"no clip-safe phase-128 selector fit reaches {limit} codes")
 
 
 def stabilize_adaptive_selector(dark: np.ndarray, bright: np.ndarray,
@@ -1492,15 +2022,14 @@ def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
     super_h = int(np.lcm(rows, h_tile))
     super_w = int(np.lcm(cols, w_tile))
 
-    # Pre-mask simulated output and the shader's pre-clip beam, per level.
-    sims, beams = [], []
+    # Pre-mask simulated output and exact post-mask source output, per level.
+    sims, references = [], []
     for code in codes:
         sims.append(simulate_flat_rgb(dark, bright, h, lut, int(code), fs))
-        beams.append(np.array([[
-            _ref_vertical_unclipped(ref, f, int(code) / 255.0, ch)
-            for ch in "rgb"] for f in fs]))
+        references.append(masked_reference_tile(
+            ref, fs, int(code), mask_encoded))
     V = np.stack(sims)                                   # (NC, F, 3)
-    B = np.stack(beams)                                  # (NC, F, 3)
+    T = np.stack(references)                              # (NC, H, W, F, 3)
 
     names, resp = [], []
     for bm in range(1, 8):
@@ -1528,24 +2057,23 @@ def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
         for yy in range(rows):
             for xx in range(group):
                 members = list(range(xx, cols, group))
-                mults = []
+                reference_cells = []
                 for sy in range(yy, super_h, rows):
                     for sx in range(super_w):
                         if sx % cols in members:
                             # Evaluator convention: np.roll(reference, (dy,dx)),
                             # hence output (sy,sx) sees unrolled cell (sy-dy,sx-dx).
-                            mults.append(mask_encoded[(sy - dy) % h_tile,
-                                                      (sx - dx) % w_tile])
-                mults = np.asarray(mults, dtype=np.float64)
-                targets = 255.0 * np.minimum(
-                    B[None, :, :, :] * mults[:, None, None, :], 1.0)
+                            reference_cells.append(((sy - dy) % h_tile,
+                                                    (sx - dx) % w_tile))
+                targets = np.stack([
+                    T[:, ry, rx, :, :] for ry, rx in reference_cells], axis=0)
 
                 if len(members) == 1:
                     # Sum_k ||R-T_k||^2 from sufficient statistics, avoiding a
                     # large (tokens x congruent-cells x levels x phases x RGB)
                     # temporary for every hardware cell.
                     tsum = targets.sum(axis=0).ravel()
-                    err = (len(mults) * r2 - 2.0 * (flat @ tsum)
+                    err = (len(reference_cells) * r2 - 2.0 * (flat @ tsum)
                            + float((targets * targets).sum()))
                     out[yy][members[0]] = names[int(np.argmin(err))]
                 else:
@@ -1565,20 +2093,37 @@ def fit_mask_joint(ref, lut: np.ndarray, dark: np.ndarray, bright: np.ndarray,
     return out, r
 
 
-def simulate_flat_rgb(dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
-                      lut: np.ndarray, code: int, fs: np.ndarray) -> np.ndarray:
-    """(F, 3) exact pre-mask output for a uniform field of `code`."""
+def simulate_uniform_rgb(dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                         lut: np.ndarray, rgb: np.ndarray,
+                         fs: np.ndarray) -> np.ndarray:
+    """Exact pre-mask output for a horizontally/vertically uniform RGB field.
+
+    The adaptive control is the shared maximum of the three exact post-H
+    channels, matching the scaler RTL.  This distinction is invisible to a
+    neutral ramp and is the central constraint for chromatic Guest fitting.
+    """
+    rgb = np.asarray(rgb, dtype=np.int64)
+    fs = np.asarray(fs, dtype=np.float64)
+    if rgb.shape != (3,) or np.any((rgb < 0) | (rgb > 255)):
+        raise ValueError("rgb must contain exactly three codes in 0..255")
     lines = np.empty(16, dtype=np.int64)
-    lines.fill(int(lut[code].max()))
-    hctrl = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
-    ctrl = np.full(len(fs), hctrl, dtype=np.int64)
+    hvalues = np.empty(3, dtype=np.int64)
+    for c in range(3):
+        lines.fill(int(lut[int(rgb[c]), c]))
+        hvalues[c] = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
+    ctrl = np.full(len(fs), int(hvalues.max()), dtype=np.int64)
     per_ch = []
     for c in range(3):
-        lines.fill(int(lut[code, c]))
-        hout = int(mm.fir_1d(lines, h, np.array([8.0]))[0])
-        lines.fill(hout)
+        lines.fill(int(hvalues[c]))
         per_ch.append(mm.fir_1d_adaptive(lines, dark, bright, 8.0 + fs, ctrl))
     return np.stack(per_ch, axis=1)
+
+
+def simulate_flat_rgb(dark: np.ndarray, bright: np.ndarray, h: np.ndarray,
+                      lut: np.ndarray, code: int, fs: np.ndarray) -> np.ndarray:
+    """(F, 3) exact pre-mask output for a uniform neutral field of ``code``."""
+    return simulate_uniform_rgb(dark, bright, h, lut,
+                                np.full(3, int(code), dtype=np.int64), fs)
 
 
 def _tile_exact_err(tokens: list[list[str]], target: np.ndarray,

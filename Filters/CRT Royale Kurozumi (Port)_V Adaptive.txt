@@ -1,8 +1,8 @@
 # Name: CRT Royale Kurozumi (Port)_V Adaptive
-# Original shader: crt-royale-kurozumi (P22/PVM preset over crt-royale); libretro/slang-shaders @ 3b0d6aa1d134
+# Original shader: crt-royale-kurozumi (P22/PVM preset over crt-royale); historical Kuro preset+Grade @ 7f34fc7469ec (Grade d5d58f8c8836) + upstream-fixed Royale bloom @ 3b0d6aa1d134
 # Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
-# Pair with the matching (Port) gamma and mask; behaviourally clip-safe
-# Endpoint rows may exceed unity where the adaptive blend keeps output in range
+# Stable adaptive seed retained by bounded historical neutral/RGB gate
+# Pair with the matching zero-black three-channel gamma and mask
 
 adaptive
 10bit

@@ -1,5 +1,5 @@
 # Name: CRT Easymode (Port)_V Adaptive
-# Original shader: crt-easymode (Easymode, GPL); libretro/slang-shaders @ 3b0d6aa1d134
+# Original shader: crt-easymode (Easymode, GPL); libretro/glsl-shaders @ 2b2c5ee3fd8e
 # Fitted to MiSTer RTL arithmetic (see tools/DESIGN.md)
 # Pair with the matching (Port) gamma and mask; behaviourally clip-safe
 # Endpoint rows may exceed unity where the adaptive blend keeps output in range
