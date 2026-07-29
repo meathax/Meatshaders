@@ -2,6 +2,7 @@
 CRT shaders for MiSTer FPGA
 ###########################
 
+Use 1080p - video mode 8 in mister ini
 -------
 CRT Lottes
   Timothy Lottes' shader with soft bloom and a stretched-VGA shadow mask.
