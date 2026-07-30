@@ -16,7 +16,7 @@ CRT Guest Advanced
   A balanced all-purpose CRT look with sharp scanlines, natural glow and a
   compact phosphor mask. Highest-resolution gamma curve of the four.
 
-CRT Royale
+CRT Royale + Kurozumi
   A detailed RGB-triad CRT with the highest white ceiling and the most accurate
   highlights. It keeps its full adaptive beam, so one class of saturated colour
   against a bright channel can shift by up to 9 codes.
