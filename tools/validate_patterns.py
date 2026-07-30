@@ -71,9 +71,6 @@ FAMILIES = (
     FamilySpec("kurozumi", "CRT Royale Kurozumi (Port)",
                "CRT Royale Kurozumi (Port).txt",
                "CRT Royale Kurozumi (Port)_V Adaptive.txt"),
-    FamilySpec("easymode", "CRT Easymode (Port)",
-               "CRT Easymode (Port).txt",
-               "CRT Easymode (Port)_V Adaptive.txt"),
     # Lottes has no LUT in the pack.  Its presets use the input codes directly.
     FamilySpec("lottes", "CRT Lottes (Port)", None,
                "CRT Lottes (Port)_V.txt", adaptive=False),

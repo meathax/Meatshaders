@@ -1,6 +1,6 @@
 """Semantic and inventory contracts for the canonical MiSTer CRT pack.
 
-Each of the five source shaders ships exactly two user-facing presets: a bare
+Each of the four source shaders ships exactly two user-facing presets: a bare
 landscape name and a ``- TATE`` transpose.  The preset files share one
 maximum-fidelity pipeline per family; the extra files referenced by a preset
 are hardware stages, not selectable shader variants.
@@ -15,13 +15,6 @@ import fileio
 
 
 FAMILY_SPECS: dict[str, dict[str, str]] = {
-    "CRT Easymode": {
-        "file_base": "CRT Easymode (Port)",
-        "vfilter": "CRT Easymode (Port)_V Adaptive.txt",
-        "gamma": "CRT Easymode (Port).txt",
-        "mask": "CRT Easymode (Port).txt",
-        "ifilter": "CRT Easymode (Port)_V No Scanlines.txt",
-    },
     "CRT Guest Advanced": {
         "file_base": "CRT Guest Advanced (Port)",
         "vfilter": "CRT Guest Advanced (Port)_V Adaptive.txt",
@@ -32,7 +25,10 @@ FAMILY_SPECS: dict[str, dict[str, str]] = {
     "CRT Lottes": {
         "file_base": "CRT Lottes (Port)",
         "vfilter": "CRT Lottes (Port)_V.txt",
-        "gamma": "off",
+        # Lottes ran with gamma disabled, which left its mask and beam
+        # throughput uncorrected: a 172 grey was perceived as 184.  It now
+        # carries the same light-linear neutral curve as the other families.
+        "gamma": "CRT Lottes (Port).txt",
         "mask": "CRT Lottes (Port).txt",
         # Lottes' brightness-independent beam fits one fixed table more closely
         # than the older adaptive pair.  That canonical V is also interlace-safe.

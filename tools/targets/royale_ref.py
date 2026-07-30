@@ -447,7 +447,7 @@ def notes():
         "a 4-tap/256-phase FIR can render without aliasing; fitting should "
         "target the L-dependent family via the adaptive (dual-set) V filter "
         "driven by brightness, accepting clipped dim-level sharpness "
-        "(trough-stddev metric from the Easymode analysis applies).",
+        "(the same full-frame trough-stddev metric applies).",
         "AUTODIM: levels_autodim_temp = 0.5 is dim-then-undim around the "
         "8-bit FBOs; net effect is only quantization headroom, no visible "
         "term to port.",

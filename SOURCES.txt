@@ -1,24 +1,20 @@
 ====================================================================
- SOURCES, LICENSES AND REPRODUCIBLE PROVENANCE - 1080p v7
+ SOURCES, LICENSES AND REPRODUCIBLE PROVENANCE - 1080p v8
 ====================================================================
 
-Audit date: 2026-07-27
+Audit date: 2026-07-30
 
 This pack is derived from the real shader programs named below. Git commits
 and paths are immutable source locks; the Guest archive additionally has a
 SHA-256 checksum. MiSTer cannot execute GLSL/Slang, so tools/targets/ contains
 executable default-parameter reference math and tools/build_port.py projects
 that math into the scaler, LUT and mask operations the FPGA actually exposes.
+tools/color_match.py then calibrates Lottes and both Royale families to the
+supplied unfiltered default.webp while retaining their CRT geometry.
 
 
 CANONICAL SHADER SOURCES
 ------------------------
-
-CRT Easymode (Easymode; source header states GPL)
-  Repository: https://github.com/libretro/glsl-shaders
-  Commit:     2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d
-  File:       crt/shaders/crt-easymode.glsl
-  Direct:     https://github.com/libretro/glsl-shaders/blob/2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d/crt/shaders/crt-easymode.glsl
 
 CRT Lottes (Timothy Lottes; source explicitly dedicates it to public domain)
   Repository: https://github.com/libretro/glsl-shaders
@@ -82,8 +78,8 @@ the current blob 92af7e73... outputs the computed color. A later irrelevant
 geometry guard is the only other sampled delta. The accidental modern-Grade
 compatibility combination is not shipped.
 
-The current glsl-shaders and slang-shaders locks used by Easymode, Lottes,
-Guest cross-checking and Royale were still repository HEAD revisions when
+The current glsl-shaders and slang-shaders locks used by Lottes, Guest
+cross-checking and Royale were still repository HEAD revisions when
 rechecked on 2026-07-27.
 
 
@@ -126,7 +122,6 @@ PORT IMPLEMENTATION
 -------------------
 
 The reproducible references are:
-  tools/targets/easymode_ref.py
   tools/targets/guest_advanced_ref.py
   tools/targets/lottes_ref.py
   tools/targets/royale_ref.py
@@ -134,19 +129,20 @@ The reproducible references are:
 
 The build and hardware model are:
   tools/build_port.py
+  tools/color_match.py
   tools/fitting.py
   tools/mister_model.py
   tools/fileio.py
 
-The v7 audit evaluates exact RGB as well as neutral fields, the complete
+The source-port audit evaluates exact RGB as well as neutral fields, the complete
 source/hardware mask supercell at the declared output origin, signal-dependent
 piecewise-sRGB mask behavior for Lottes, RGB shared-control behavior for Guest,
 and complete 1080-line stability at 224p and 240p. Generated filters have 256
 phases and signed 10-bit coefficients and are accepted through the integer RTL
 model, not floating coefficient-sum estimates.
 
-Easymode- and Guest/Royale-derived material retains the corresponding source
-license status. Kurozumi is a preset over Royale; Lottes' source states public
-domain. These files reproduce source behavior only within MiSTer's documented
-fixed pipeline. See tools/DESIGN.md and AUDIT_REPORT.txt for the measured
-mapping and irreducible limits.
+Guest/Royale-derived material retains the corresponding source license status.
+Kurozumi is a preset over Royale; Lottes' source states public domain. The
+calibrated runtime files preserve the upstream spatial design but deliberately
+replace display tint/attenuation with default-reference colour matching. See
+tools/DESIGN.md and AUDIT_REPORT.txt for the measured mapping and limits.

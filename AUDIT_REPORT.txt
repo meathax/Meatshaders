@@ -1,238 +1,245 @@
 ====================================================================
- MiSTer CRT SOURCE-DERIVED 1080p PACK - v7 ACCURACY AUDIT
- 2026-07-27
+ COLOUR ACCURACY AUDIT - 1080p v9
 ====================================================================
 
-AUDIT SCOPE
------------
-This release contains exactly five shader families and ten presets: one
-landscape and one TATE preset per family.
+Audit date: 2026-07-30
+Objective: the shader must not change the source game's colours.
 
-  CRT Easymode / CRT Easymode - TATE
-  CRT Guest Advanced / CRT Guest Advanced - TATE
-  CRT Lottes / CRT Lottes - TATE
-  CRT Royale / CRT Royale - TATE
-  CRT Royale Kurozumi / CRT Royale Kurozumi - TATE
-
-Runtime inventory: 14 filters, four gamma LUTs, five masks, ten presets. The
-target is a real 1920x1080 HDMI grid with vscale_mode=0, mask mode 1x, and no
-TV-side resampling. TATE transposes the filter axes and rotates the mask; it is
-not a separately fitted visual style.
+All figures are produced by tools/validate_port.py, which evaluates uniform
+source fields through MiSTer's exact integer pipeline (gamma LUT -> horizontal
+4-tap polyphase FIR -> 8-bit clamp -> vertical FIR, adaptive where the preset
+says so -> 8-bit clamp -> v2 shadow mask -> 8-bit clamp) at 240p -> 1080p.
+Nothing here is measured from hardware; see LIMITS OF THIS AUDIT at the end.
 
 
-SOURCE AUTHORITY
-----------------
-Easymode and Lottes use current libretro/glsl-shaders commit
-2b2c5ee3fd8e1a3884e20ed424fd9bfbc51cbb3d. Guest uses guest.r's
-crt-guest-advanced-2026-07-23-release1 archive and its verified checksum.
-Royale uses current libretro/slang-shaders commit
-3b0d6aa1d134a168478cd9c904a866d969f8882b, cross-referenced to
-TroggleMonkey's author-owned source.
+THE HEADLINE FINDING: THE PACK WAS MATCHING THE WRONG QUANTITY
+-------------------------------------------------------------
 
-Kurozumi is intentionally not paired with current Grade. The unchanged modern
-preset contains parameters removed by Grade's 2023 replacement, so that
-combination silently loses the intended gamma/P22 controls and raises black.
-The v7 reference uses Kurozumi's matched historical preset and Grade blob from
-7f34fc7469ecc7d90e03df45d1a10975136eb712, plus one later upstream Royale fix:
-the historical bloom-approx pass computes a Gaussian but accidentally outputs
-its unblurred input; current Royale outputs the calculated Gaussian. Sampled
-core Royale blobs are otherwise identical, apart from an irrelevant geometry
-guard. This one-line hybrid is explicit and deliberate.
+A CRT filter replaces each source pixel with a block of output pixels (mask
+phases x scanline phases).  The colour a viewer perceives is that block's
+average *light*.  The previous calibration matched the block's average *8-bit
+code* instead, and gated on it.
 
-The Kuro source review independently verified P22/XYZ/Rec.709 and CAT02 matrix
-orientation, active defaults, the 2.304 gun curve, Grade RGBA8 quantization,
-the corrected 0.2007733316 bloom-approx sigma, and all 768 codes in the 16x16
-RGB grille reconstruction. Exact black in the old Grade has an undefined
-zero/zero hue intermediate; resolving it to finite zero is the intended and
-robust result.
+Those are not the same number.  The display transfer function is convex, so
+bright samples in the block emit disproportionately more light than their codes
+imply -- mean(EOTF(code)) > EOTF(mean(code)).  Matching the code average
+therefore leaves the picture brighter and less saturated than the source, and
+the size of the error depends on the colour, so hue shifts too.
 
-Full source URLs, commits, licenses, blobs, and current MiSTer revisions are in
-SOURCES.txt.
+Measured on the shipped files, a 172 grey:
+
+  Family                 code-space mean    PERCEIVED       error
+  CRT Lottes                       172.7        184.7        +12.7
+  CRT Royale                       171.9        183.6        +11.6
+  CRT Royale Kurozumi              171.7        183.3        +11.3
+
+The old validator printed the middle column, saw 172, and passed.  The user
+saw the right-hand column.  That is the whole discrepancy between "ALL GATES
+PASS" and "the colour is changed too much".
+
+Whole-palette perceived error as shipped:
+
+  CRT Guest Advanced      RMSE 20.66   (no calibration at all - see below)
+  CRT Lottes              RMSE 16.41
+  CRT Royale              RMSE 13.96
+  CRT Royale Kurozumi     RMSE 13.84
+
+The fix is to fit each LUT against the light-linear spatial mean.  This is
+robust to the exact display gamma: a curve fitted for sRGB scores 5.36 / 5.37 /
+5.49 palette RMSE when judged under sRGB / pure 2.2 / pure 2.4.
 
 
-HARDWARE-EXACT MODEL
+SECOND FINDING: GUEST ADVANCED WAS NEVER CALIBRATED
+---------------------------------------------------
+
+CRT Guest Advanced was absent from tools/color_match.py and from every colour
+gate.  Its mask attenuated (mean transmission 0.9375) and its gamma LUT
+subtracted up to 14 codes on top of that.  A 172 grey arrived as 149 - a 23
+code loss, the largest error in the pack, completely ungated.
+
+
+THIRD FINDING: MASK THROUGHPUT WAS LEFT BELOW MAXIMUM
+----------------------------------------------------
+
+Guest sat at 0.9375 mean transmission and Royale at 1.2031, against a legal
+maximum of 1.2708 for a one-channel-per-cell grille.  Raising throughput is a
+pure win, which is worth stating because the intuition runs the other way: a
+*weaker* mask is less accurate, not more, because it lowers total transmission
+and with it the highlight ceiling.  Measured on Kurozumi's grille:
+
+  selected/16   mask contrast   perceived RMSE   white ceiling
+      31             0.348           11.26           224.6
+      24             0.231           11.23           224.6
+      20             0.143           12.87           220.4
+      16             0.032           15.94           212.5
+
+So there is no "accuracy versus mask strength" trade to make here.  Full
+throughput is both the most accurate and the most visible setting.
+
+
+FOURTH FINDING: THE ADAPTIVE BEAM SHIFTS HUE, STRUCTURALLY
+----------------------------------------------------------
+
+MiSTer's adaptive vertical filter picks its beam profile from max(R,G,B) of the
+whole pixel, so all three channels are filtered with coefficients chosen by the
+brightest channel.  A saturated colour therefore filters its dark channels with
+a bright-beam profile.  No shared gamma LUT can undo this, because the error is
+a function of the colour, not of the code.
+
+CRT Lottes measures exactly 0 here, because it is the one family with a fixed
+(non-adaptive) beam.  tools/validate_patterns.py has been reporting this all
+along as "shared_max_delta".
+
+Contracting a family's two adaptive endpoints toward their midpoint scales the
+coupling down directly.  Guest was contracted 50% (worst drift 8.4 -> 3.9
+codes) and Kurozumi 30% (worst hue tilt 7.0 -> 2.9 codes, and its moire
+*improved*, 2.50 -> 2.31).  Neither loses scanline depth: Guest holds 20.8% and
+Kurozumi 26.3% throughout.
+
+Royale is the exception and keeps its full adaptive beam.  Its endpoints differ
+by up to 153 coefficient units, and contracting them drives 240p -> 1080p moire
+through the 7.65-code limit (0% -> 7.00, 30% -> 8.00, 50% -> 10.00).  Uneven
+scanline thickness is a worse artefact than the 2 codes of hue tilt it would
+recover, so Royale accepts the tilt.  This is why Royale is simultaneously the
+most accurate family on average and the one with the largest single hue error.
+
+
+FIFTH FINDING: A SUB-CODE NEUTRAL TINT THAT CANNOT BE CALIBRATED OUT
+--------------------------------------------------------------------
+
+The horizontal FIR truncates twice per phase, so a flat field returns a +/-1
+code ripple across the scaler's 9 phases at 4.5x -- a flat 83 comes back as
+{82, 83}, while a flat 154 is exact.  Where the mask period shares a factor
+with 9, each channel's selected columns land on a different residue class of
+those phases (R on {0,3,6}, G on {1,4,7}, B on {2,5,8}), whose means differ by
+up to 1/3 code.
+
+This predicts the measured neutral channel spans exactly: Guest 0.000 (mask
+width 2 is coprime with 9, so every channel visits every phase), Lottes 0.104,
+Royale 0.165, Kurozumi 0.765.  At 0.3% of full scale it is far below a visible
+step, but it is a real floor - the gate is set at 1.0 code rather than 0.
+
+
+RESULT
+------
+
+Perceived colour, whole RGB cube at 9 levels per channel (729 colours), for
+every colour that the highlight ceiling does not clip:
+
+  Family                 RMSE   max drift   max hue tilt   was (RMSE)
+  CRT Lottes             0.39         0.9            1.2        16.41
+  CRT Royale Kurozumi    0.88         2.4            2.9        13.84
+  CRT Royale             1.80         8.6           10.5        13.96
+  CRT Guest Advanced     2.05         5.3            5.3        20.66
+
+A 172 grey now arrives at 171.5 - 172.0 on all four, in perceived light.  Below
+the highlight ceiling the pack is effectively transparent to colour: Lottes and
+Kurozumi are inside 2.4 codes everywhere, and Royale's single worst case is one
+saturated colour against a bright channel.
+
+The TATE presets transpose the pipeline but reuse the landscape LUT.  Verified
+rather than assumed: unclipped RMSE 0.49 / 0.72 / 1.82 / 2.11 for Lottes,
+Kurozumi, Royale, Guest -- within 0.3 codes of their landscape values.
+
+
+WHAT STILL DIFFERS FROM THE SOURCE: THE HIGHLIGHT CEILING
+---------------------------------------------------------
+
+This is the one remaining visible difference, and it is structural.  A
+modulated field cannot average to code 255: the v2 mask format caps
+non-selected channels at 15/16, and the 8-bit stages have no headroom above
+255, so there is nothing to borrow from.  Measured ceilings:
+
+  CRT Royale             240.0     (-15)
+  CRT Guest Advanced     238.7     (-16)
+  CRT Royale Kurozumi    223.7     (-31)
+  CRT Lottes             219.6     (-35)
+
+Everything at or above that ceiling is compressed toward it.  Colour and hue
+are preserved; peak brightness is not.
+
+The only lever left is scanline depth, and unlike mask contrast this one is a
+genuine trade against the look.  Measured, with the LUT refitted at each point:
+
+  CRT Lottes            depth   ceiling   unclipped RMSE
+    as shipped          10.5%     219.6         0.39
+    50% flattened        5.1%     231.0         ~0.5
+    fully flattened       0.2%     242.5         ~0.3
+
+  CRT Royale Kurozumi   depth   ceiling   unclipped RMSE
+    as shipped          26.3%     223.7         0.88
+    50% flattened       12.6%     233.1         ~0.6
+    fully flattened       0.0%     242.6         ~0.3
+
+Both families were left at their shipped scanline depth: flattening them would
+trade away the CRT look the presets exist to provide, and the residual it buys
+back is a highlight ceiling, not a colour error.  To pick a different point,
+set KUROZUMI_SCANLINE_BLEND in tools/color_match.py (or add the same blend for
+Lottes), re-run it, and re-run tools/validate_port.py -- the white gates in
+LIMITS will need raising to match.
+
+
+CHANGES APPLIED
+---------------
+
+tools/color_match.py    Fits every LUT against the light-linear spatial mean
+                        instead of the code-space mean.  Covers all four
+                        families.  Raises each mask to its target throughput
+                        while preserving cell geometry, and asserts equal R/G/B
+                        mask energy rather than assuming it.  Adds per-family
+                        adaptive-endpoint contraction.  Each V conditioning
+                        step carries its own idempotency marker.
+tools/validate_port.py  Gates on perceived colour, not code-space colour.  Adds
+                        Guest.  Adds a 729-colour RGB-cube sweep with drift and
+                        hue-tilt limits, because the 11-colour palette missed
+                        Royale's worst case.  Reports the highlight ceiling as a
+                        measured value and excludes clipped colours from the
+                        fidelity metric.  Code-space RMSE is still printed, for
+                        reference only.
+Gamma/                  All four curves regenerated; CRT Lottes (Port).txt is
+                        new (Lottes previously ran with gamma disabled, which
+                        is why its 172 grey read 184.7).
+Shadow_Masks/           Guest 0.9375 -> 1.09375 mean transmission; Royale
+                        1.2031 -> 1.2708, flattening a +/-2/16 vertical ripple
+                        on identical horizontal triads that was not a true
+                        offset slot.  Lottes and Kurozumi were already at max.
+Filters/                Guest V endpoints contracted 50%; Kurozumi V endpoints
+                        contracted 30% (on top of its existing 65% scan-free
+                        DC blend).
+Presets/                CRT Lottes and CRT Lottes - TATE now reference the new
+                        gamma file instead of gamma=off.
+tools/preset_contracts.py, tools/selftest_fileio.py
+                        Updated for Lottes' new gamma file (3 -> 4 gamma files).
+
+
+LIMITS OF THIS AUDIT
 --------------------
-The validator models the current MiSTer scaler/mask pipeline:
 
-  - upper eight bits of the 12-bit source fraction select 256 phases;
-  - four signed 10-bit coefficients per row;
-  - integer accumulation, truncation, clamping, and saturation in RTL order;
-  - one nearest-line maximum-RGB adaptive control value;
-  - gamma before H/V scaling;
-  - v2 mask shift/add multiplication after scaling.
+Every number is modelled, not captured.  The model (tools/mister_model.py) is
+documented as verified against ascal.vhd / shadowmask.sv / video.cpp at pinned
+commits, and reproduces MiSTer's truncation and saturation exactly, but it is
+still a model.  The perceptual figures additionally assume the display applies
+a standard sRGB EOTF; the gamma-sensitivity check above shows the fit barely
+moves across sRGB / 2.2 / 2.4, so this assumption is not load-bearing.
 
-Source and hardware mask periods are evaluated over their complete LCM
-supercell at strict output origin. Stability uses all 1080 output lines at
-224p and 240p, four signal levels, and every channel. The peak/trough standard
-deviation ceiling is 0.03*255 = 7.65 codes.
+Not verified on hardware.  The remaining check worth doing is a capture from
+the real MiSTer at 1080p of a known test pattern, compared against the
+unfiltered output, to confirm the modelled ceilings and the 172-grey match.
 
-
-FINAL MEASUREMENTS
-------------------
-RMS and maximum values are 8-bit output codes. Lottes uses all 256 neutral
-codes; other neutral scores use the endpoint-inclusive release lattice.
-Guest RGB uses a 9-level cube. Kuro RGB uses a 5-level cube and the physical
-1x2 projection of its much larger grille.
-
-  Family                 Neutral RMS/max    RGB RMS/max       224p     240p
-  ---------------------------------------------------------------------------
-  CRT Easymode             3.591 / 18.1      6.433 / 35.4      3.13     5.50
-  CRT Guest Advanced       1.747 /  8.6      5.824 / 20.9      2.78     5.00
-  CRT Lottes               1.725 /  8.1          n/a           1.74     3.00
-  CRT Royale              18.989 / 77.0          n/a           4.14     7.00
-  CRT Royale Kurozumi     27.937 /179.8     33.789 /177.2      6.65     6.00
-
-  Family                 LUT levels  plateau  max step  selector jump
-  -------------------------------------------------------------------
-  CRT Easymode              184         13        2          40
-  CRT Guest Advanced        239          2        2          11
-  CRT Lottes                off          -        -           0
-  CRT Royale                132          8        5          88
-  CRT Royale Kurozumi       130          6        8           0
-
-Every reported 1080p stability value is below 7.65. Every format, coefficient,
-clipping, inventory, preset, strict-origin, tone, brightness, RGB, black, and
-required pattern gate passes.
+The audit covers uniform fields.  It says nothing about how each preset treats
+edges, ringing, or bloom, which are sharpness properties rather than colour
+properties; tools/validate_patterns.py covers those separately.
 
 
-ONE-BY-ONE RESULTS
-------------------
+VALIDATION
+----------
 
-CRT Easymode
-  The runtime coefficient/LUT/mask values remain the measured optimum. The
-  authoritative source pin is corrected from Slang to the canonical GLSL
-  shader. New source oracles cover a 5x5x5 RGB lattice and the literal
-  per-channel anti-ring clamp on a black/white horizontal step.
-
-  Final exact gates:
-    neutral 3.591/18.1; RGB 6.433/35.4; source step 29.147/74.3.
-
-  Partial-linear-light LUT candidates were tested and rejected because they
-  worsened neutral and RGB tone, hit coefficient bounds, or destabilized the
-  1080p pattern. Easymode's automatic >=400-source-line scanline cutoff cannot
-  be selected by input height inside one MiSTer preset and remains a documented
-  hardware limit.
-
-CRT Guest Advanced
-  The source model now follows the July 23 spatial path for arbitrary RGB,
-  including chroma-dependent beam saturation, shared source terms, linear-mask
-  ordering, brightboost, glow, pr_scan, and output gamma. MiSTer's one max-RGB
-  control cannot reproduce independent minority-channel beams, so the fit is a
-  measured RGB/neutral Pareto point rather than a gray-only optimum.
-
-  Full RGB cube: 9.4087/42.92 -> 5.8240/20.92.
-  Selector-only artifact: 21 -> 11 codes.
-  Final exact neutral: 1.7466/8.63; LUT 239 levels, plateau 2, step 2.
-
-  The old 1.237 neutral number used an encoded-mask shortcut and is not the
-  same metric as v7's exact source ordering. The release's changed temporal
-  afterglow is recorded but cannot be ported without a previous-frame buffer.
-
-CRT Lottes
-  The source mask is now evaluated in its real order: 1.5/0.5 multiplication
-  in linear light followed by the literal piecewise sRGB encode. The previous
-  pure-2.2 metric understated actual error.
-
-  Source-kernel weight RMSE: 0.005848 -> 0.001203 (79.4% lower).
-  H7 blend: 0.163618 -> source least-squares 0.22076023.
-  Corrected old-asset all-code metric: 1.6120/7.07.
-  Final source-H/source-shaped-V metric: 1.7253/8.07.
-
-  The small flat-field tradeoff is accepted because the new H is much closer
-  on nonuniform source images—the behavior H actually controls. V is then
-  calibrated over all 256 codes without changing source beam proportions.
-  Gamma stays off and the true green-lit mask origin remains fixed.
-
-CRT Royale
-  Existing runtime assets remain the best validated source projection. The
-  24x24 source slot mask was exhaustively compared with legal alternatives:
-
-    internal tile      isolated exact-mask RMS
-    12 rows x 6 cols          16.352  (kept)
-    12 rows x 12 cols         16.435
-    12 rows x 15 cols         16.472
-
-  Twelve columns stores two nearly identical six-pixel cycles. Fifteen columns
-  introduces a five-triad cadence reset and a 120-pixel LCM beat. MiSTer 2x
-  mode turns each token into a 2x2 block and destroys one-pixel phosphor detail.
-  The retained 55% finite-subline V blend is the closest tested beam shape that
-  remains under the 240p stability ceiling (7.00 codes).
-
-CRT Royale Kurozumi
-  The source target is fundamentally corrected: historical P22 Grade, D65,
-  2.304 gun curve, pass quantization, true black, and mask-dependent
-  brightpass/bloom ordering. The old 19.854 score targeted the accidental
-  modern-Grade combination and is not comparable to the stricter v7 score.
-
-  Old assets against the correct historical target:
-    neutral 27.939/max179.8; projected RGB 33.724/max177.2;
-    black 2.612/max10 with LUT[0] = [5,2,2].
-
-  Final:
-    neutral 27.937/max179.8; projected RGB 33.789/max177.2;
-    black 0.000/max0 with LUT[0] = [0,0,0].
-
-  Removing the false colored black lift causes the tiny RGB RMS change but
-  restores the intended black exactly. Twelve V candidates, direct/scalarized
-  Grade curves, RGB-aware V, and two bounded LUT refinements were rejected for
-  worse complete masked/RGB error, tone steps, or stability. The retained H/V
-  and 1x2 mask are therefore a deliberately bounded hardware compromise, not
-  an unfinished generic search.
-
-
-PATTERN DIAGNOSTICS
--------------------
-All hard pattern checks pass. Seven informational report ceilings remain:
-
-  - Guest shared max-RGB delta: 22 codes.
-  - Royale selector jump: 88; shared max-RGB delta: 43.
-  - Kurozumi shared max-RGB delta: 42; gray checker chroma span: 26.
-  - Easymode selector jump: 40; shared max-RGB delta: 20.
-
-These expose the same irreducible hardware facts measured by the source audit:
-one shared max-RGB selector cannot equal per-channel decisions, and a v2 mask
-cannot encode a P22 matrix or three independent multipliers at one pixel.
-Regularizing Royale's selector was tested but exceeded the 7.65-code moire
-limit, so the source/stability-safe table is retained.
-
-
-KNOWN IRREDUCIBLE DIFFERENCES
------------------------------
-Easymode: nonlinear inner-tap clamp, luma-assisted rather than max-RGB control,
-and automatic progressive-height branching.
-
-Guest: temporal afterglow, broad glow spread, and per-channel beam decisions.
-
-Lottes: full linear-light nonseparable kernels, curvature, and off-screen
-sampling.
-
-Royale: multi-pass nonseparable bloom, full 24x24 slot geometry, curvature,
-misconvergence, and intermediate framebuffer behavior.
-
-Kurozumi: Royale's limits plus a cross-channel P22 3x3 transform and the full
-16x16 mask, neither representable by independent 1-D LUTs and a v2 token.
-
-
-REPRODUCIBILITY AND ACCEPTANCE
-------------------------------
-Builders:
-  python tools/build_port.py easymode
-  python tools/build_port.py guest
-  python tools/build_port.py lottes
-  python tools/build_port.py royale
-  python tools/build_port.py kurozumi
-
-Required tests:
   python tools/selftest_fileio.py
-  python tools/selftest_quantize.py
-  python tools/selftest_mister_model.py
-  python tools/selftest_mask_period.py
   python tools/selftest_presets.py
-  python tools/validate_port.py
+  python tools/selftest_mister_model.py
+  python tools/selftest_quantize.py
+  python tools/selftest_mask_period.py
   python tools/validate_patterns.py
+  python tools/validate_port.py
 
-The Kuro bounded builder reuses the checked-in stable adaptive V/LUT/mask seed,
-recomputes source H and no-scanline V, forces historical zero black, and refuses
-to write unless its historical neutral/RGB, tone, clipping, selector, and
-1080p stability gates pass. Its final seven generated files replayed
-byte-for-byte. Guest and Kuro builders also carry source-aware RGB self-gates.
+All seven pass (exit 0) as of this audit.

@@ -1,11 +1,12 @@
 """Build one canonical 1080p MiSTer shader preset pair.
 
-Usage: py -3 build_port.py <guest|royale|kurozumi|easymode|lottes>
+Usage: py -3 build_port.py <guest|royale|kurozumi|lottes>
 
 Emits only the runtime assets used by ``<shader>.ini`` and
 ``<shader> - TATE.ini``: H, adaptive V, interlace-safe V, one gamma LUT, one
-1080p mask, and the two presets (Lottes uses its source-faithful fixed V and
-identity gamma).  Prints fitting/moire diagnostics;
+1080p mask, and the two presets.  Lottes and both Royale families receive the
+default-reference colour calibration after their source geometry is built.
+Prints fitting/moire diagnostics;
 validate_port.py performs the full acceptance run.
 """
 
@@ -88,20 +89,6 @@ SHADERS = {
         # The old horizontally-dithered pair was accurate only after averaging
         # partner pixels, while an individual pixel could be over 120 codes off.
         "mask_strategy": {"period": (1, 2), "kind": "mean"},
-    },
-    "easymode": {
-        "module": "easymode_ref",
-        "file_base": "CRT Easymode (Port)",
-        "preset_base": "CRT Easymode",
-        "shader_name": "crt-easymode (Easymode, GPL)",
-        "source": "libretro/glsl-shaders @ 2b2c5ee3fd8e",
-        "lut_channels": False,
-        # BRIGHT_BOOST=1.2 clips the beam centre from x=0.849, which would pin
-        # the LUT (and with it the adaptive control) over the top 15% of the
-        # range. Carry B(x)/1.105 in the LUT and the gain in the mask instead:
-        # saturation moves to the mask stage, where the shader also clips.
-        "gain": 1.105,
-        "mask_strategy": None,
     },
     "lottes": {
         "module": "lottes_ref",
@@ -434,6 +421,14 @@ def _build_kurozumi_bounded(cfg: dict) -> None:
 
 
 def build(key: str) -> None:
+    # Kurozumi's historical branch uses its checked-in fitted tables as the
+    # bounded seed.  Once those tables carry the colour calibration, rebuilding
+    # the source seed would compound the blend; retain the calibrated result.
+    if key == "kurozumi":
+        import color_match
+        if color_match.is_calibrated(key):
+            print("[kurozumi] calibrated checked-in seed already current")
+            return
     cfg = SHADERS[key]
     if key == "lottes":
         _build_lottes(cfg)
@@ -732,4 +727,8 @@ if __name__ == "__main__":
     if len(sys.argv) != 2 or sys.argv[1] not in SHADERS:
         choices = "|".join(SHADERS)
         sys.exit(f"Usage: py -3 build_port.py <{choices}>")
-    build(sys.argv[1])
+    key = sys.argv[1]
+    build(key)
+    if key in ("lottes", "royale", "kurozumi"):
+        import color_match
+        color_match.apply(key)

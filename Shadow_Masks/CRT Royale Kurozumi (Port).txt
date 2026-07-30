@@ -1,10 +1,9 @@
 ####
 # Name: CRT Royale Kurozumi (Port)
-# crt-royale-kurozumi (P22/PVM preset over crt-royale); historical Kuro preset+Grade @ 7f34fc7469ec (Grade d5d58f8c8836) + upstream-fixed Royale bloom @ 3b0d6aa1d134
-# Stable end-to-end 1x2 aperture-grille fit in MiSTer v2 arithmetic
-# Selected against the historical Grade/Royale neutral and RGB oracle
-# Pair only with the matching (Port) gamma and adaptive V
+# Source-preserving colour calibration (light-linear)
+# Equal mean R/G/B energy at 31/16 selected, 15/16 other
+# Fitted against the light-linear spatial mean at 240p -> 1080p
 ####
 v2
-2,1
-63a,33a
+3,1
+4ff,2ff,1ff

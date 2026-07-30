@@ -1,4 +1,4 @@
-"""Self-test the ten canonical presets and landscape/TATE contracts."""
+"""Self-test the eight canonical presets and landscape/TATE contracts."""
 
 import os
 import sys

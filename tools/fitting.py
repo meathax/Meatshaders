@@ -104,8 +104,8 @@ def _transfer_unclipped(ref, x: float) -> float:
 def has_headroom(ref) -> bool:
     """True when the shader's beam-centre transfer clips before x=1.
 
-    Such shaders (Lottes brightBoost/bloom gain, Easymode BRIGHT_BOOST,
-    Kurozumi levels_contrast) cannot use the plain LUT-carries-transfer
+    Such shaders (Lottes brightBoost/bloom gain and Kurozumi
+    levels_contrast) cannot use the plain LUT-carries-transfer
     factorization without saturating the adaptive control — see fit_gain_split.
     """
     return _transfer_unclipped(ref, 1.0) > 1.0 + 1e-9
