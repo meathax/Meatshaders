@@ -21,11 +21,6 @@ CRT Royale
   highlights. It keeps its full adaptive beam, so one class of saturated colour
   against a bright channel can shift by up to 9 codes.
 
-CRT Royale Kurozumi
-  A PVM-style Royale variant with deep blacks and an aperture-grille mask.
-  Second most accurate after Lottes, with a higher white ceiling.
-
-
 Each shader preset has a TATE variant for vertically rotated games.
 
 
