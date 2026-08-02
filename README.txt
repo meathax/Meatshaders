@@ -4,7 +4,7 @@ CRT shaders for MiSTer FPGA
 
 Use 1080p - video mode 8 in mister ini
 
-Four CRT presets for MiSTer at 1080p, calibrated so the shader does not
+Three CRT presets for MiSTer at 1080p, calibrated so the shader does not
 change your game's colours.
 
 CRT Lottes
